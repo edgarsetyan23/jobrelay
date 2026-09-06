@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JobRelay -- an interactive dispatch workshop</title>
+  <meta name="description" content="Submit an image, watch a real worker process it, and pull the plug to see the queue recover." />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <h1>JobRelay Workshop</h1>
+    <p class="tagline">Pull the plug. Watch it recover.</p>
+    <p class="sub">An asynchronous job-processing service you can see and break, on purpose.</p>
+    <p id="worker-banner" class="worker-banner" role="status" hidden>
+      No main worker is currently running -- normal uploads will sit in "waiting" until you start one with
+      <code>npm run dev:worker</code>.
+    </p>
+  </header>
+
+  <main id="main">
+    <section aria-labelledby="upload-heading">
+      <h2 id="upload-heading">Submit a task</h2>
+      <div class="upload-area">
+        <button type="button" class="dropzone" id="dropzone" aria-describedby="dropzone-help">
+          <div class="dz-title">Drop an image here, or click to choose one</div>
+          <div class="dz-sub" id="dropzone-help">JPEG, PNG, or WebP. We'll generate three gallery thumbnails.</div>
+          <input type="file" id="file-input" accept="image/jpeg,image/png,image/webp" />
+        </button>
+        <div class="upload-preview" id="upload-preview">
+          <div class="status-line">No file chosen yet.</div>
+        </div>
+      </div>
+      <div class="field-row">
+        <button type="button" class="secondary" id="try-sample">Try a sample</button>
+        <button type="button" id="submit-upload" disabled>Submit ticket</button>
+        <span id="upload-status" class="status-line" role="status"></span>
+      </div>
+    </section>
+
+    <section aria-labelledby="board-heading">
+      <h2 id="board-heading">Dispatch board <span class="hint">updates every ~1.5s from live job data</span></h2>
+      <div class="board">
+        <div class="column">
+          <h3>Waiting <span class="count" id="count-queued">0</span></h3>
+          <div id="column-queued"></div>
+        </div>
+        <div class="column">
+          <h3>Processing <span class="count" id="count-running">0</span></h3>
+          <div id="column-running"></div>
+        </div>
+        <div class="column">
+          <h3>Completed <span class="count" id="count-succeeded">0</span></h3>
+          <div id="column-succeeded"></div>
+        </div>
+        <div class="column">
+          <h3>Failed <span class="count" id="count-failed">0</span></h3>
+          <div id="column-failed"></div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="stations-heading">
+      <h2 id="stations-heading">Worker stations</h2>
+      <div class="stations" id="stations"></div>
+    </section>
+
+    <section aria-labelledby="detail-heading">
+      <h2 id="detail-heading">Selected ticket</h2>
+      <p id="detail-empty">Click a ticket on the dispatch board to see its event history and results here.</p>
+      <div id="detail-content" hidden></div>
+    </section>
+
+    <section class="demo-panel" id="demo-section" aria-labelledby="demo-heading">
+      <h2 id="demo-heading">Demonstration panel <span class="hint">isolated demo queue &amp; workers -- never touches normal traffic</span></h2>
+      <div class="demo-controls">
+        <div class="demo-card">
+          <h3>1. Send twice</h3>
+          <p>Submits the same ticket twice with the same idempotency key. Both requests should return the identical job.</p>
+          <button type="button" id="demo-send-twice">Send twice</button>
+          <div class="result" id="result-send-twice"></div>
+        </div>
+        <div class="demo-card">
+          <h3>2. Fail this attempt</h3>
+          <p>Submits a demo ticket that fails its first attempt on purpose, then retries and succeeds.</p>
+          <button type="button" id="demo-fail-attempt">Fail this attempt</button>
+          <div class="result" id="result-fail-attempt"></div>
+        </div>
+        <div class="demo-card">
+          <h3>3. Stop this worker</h3>
+          <p>Kills the real demo worker process handling a slow ticket, mid-job. A sibling worker recovers it once the queue notices.</p>
+          <button type="button" class="danger" id="demo-stop-worker">Stop this worker</button>
+          <div class="result" id="result-stop-worker"></div>
+        </div>
+      </div>
+      <p class="limitation-note">
+        These controls only ever affect isolated demo tickets and the demo worker pool this server spawned for itself --
+        they cannot touch a normal visitor's upload or any other process. This app is a local demonstration and is not
+        deployed publicly.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    JobRelay -- a local reliability-engineering demo. Source and docs in the repository README.
+  </footer>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

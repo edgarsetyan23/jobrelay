@@ -1,0 +1,33 @@
+name: jobrelay
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: jobrelay-postgres
+    environment:
+      POSTGRES_USER: jobrelay
+      POSTGRES_PASSWORD: jobrelay
+      POSTGRES_DB: jobrelay
+    ports:
+      - "5432:5432"
+    volumes:
+      - jobrelay-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobrelay -d jobrelay"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: jobrelay-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  jobrelay-pg-data:
