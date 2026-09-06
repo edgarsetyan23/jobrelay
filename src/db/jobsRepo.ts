@@ -26,6 +26,8 @@ export interface JobRow {
   finished_at: Date | null;
   /** Fencing token stamped by the attempt currently entitled to finalize this job -- see transitionToRunning. */
   running_token: string | null;
+  /** The token of the one attempt whose files are the published result, written once by transitionToSucceeded. Unlike running_token, this is never overwritten again -- see storage/paths.ts "Attempt isolation" and 004_result_attempt_token.sql. */
+  result_attempt_token: string | null;
 }
 
 export interface OutboxRow {
@@ -121,6 +123,22 @@ export async function createJobWithOutbox(pool: Pool, input: CreateJobInput): Pr
 export async function getJobById(pool: Pool, id: string): Promise<JobRow | undefined> {
   const { rows } = await pool.query<JobRow>("SELECT * FROM jobs WHERE id = $1", [id]);
   return rows[0];
+}
+
+export interface JobResultLocation {
+  status: JobStatus;
+  resultAttemptToken: string | null;
+}
+
+/** A narrow, hot-path query for the download endpoint (api/routes/files.ts) -- it needs only enough to decide which attempt's directory to serve from, not the job's full payload/result JSON. */
+export async function getJobResultLocation(pool: Pool, id: string): Promise<JobResultLocation | undefined> {
+  const { rows } = await pool.query<{ status: JobStatus; result_attempt_token: string | null }>(
+    "SELECT status, result_attempt_token FROM jobs WHERE id = $1",
+    [id],
+  );
+  const row = rows[0];
+  if (!row) return undefined;
+  return { status: row.status, resultAttemptToken: row.result_attempt_token };
 }
 
 export interface ListJobsOptions {
@@ -240,8 +258,13 @@ export async function transitionToSucceeded(
   attempts: number,
   runningToken: string,
 ): Promise<JobRow | undefined> {
+  // result_attempt_token is stamped in the same guarded UPDATE that decides
+  // the winner -- there is no separate write, so there's no window where
+  // the job is 'succeeded' without yet knowing which attempt's files are
+  // authoritative. See storage/paths.ts "Attempt isolation" and
+  // api/routes/files.ts, the only reader of this column.
   const { rows } = await pool.query<JobRow>(
-    `UPDATE jobs SET status = 'succeeded', result = $2, error = NULL, attempts = $3, finished_at = now(), updated_at = now()
+    `UPDATE jobs SET status = 'succeeded', result = $2, error = NULL, attempts = $3, result_attempt_token = $4, finished_at = now(), updated_at = now()
      WHERE id = $1 AND status NOT IN ('succeeded', 'failed') AND running_token = $4
      RETURNING *`,
     [jobId, JSON.stringify(result), attempts, runningToken],

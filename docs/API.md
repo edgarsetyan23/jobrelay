@@ -83,8 +83,14 @@ curl "http://localhost:3000/api/jobs?status=failed&limit=10"
 ## `GET /files/results/:jobId/:label.jpg`
 
 Serves a generated thumbnail (`label` is `small`, `medium`, or `large`).
-**404** if the job id or label doesn't match the expected shape, or the file
-has been deleted by the retention sweep.
+Every request looks up which attempt's directory is authoritative for this
+job in Postgres (`jobs.result_attempt_token`) before touching the
+filesystem -- there is no fixed on-disk path this could otherwise assume
+(see docs/ARCHITECTURE.md "Attempt isolation"). **404** if the job id or
+label doesn't match the expected shape, the job hasn't succeeded (or
+succeeded to a token whose files aren't there for some other reason), or the
+files have since been deleted by the retention sweep -- these all look
+identical from the outside.
 
 ## `GET /healthz`
 

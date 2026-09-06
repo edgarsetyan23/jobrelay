@@ -11,11 +11,16 @@
 // independently-recovering attempt is also mid-flight. Without an ownership
 // check, whichever of the two finishes first wins arbitrarily, even though
 // only the recovering attempt is "supposed to" own the job by then.
+//
+// This uses a manually-controlled gate (`beforeSuccessCommit`), not a timed
+// `slow` fault, to hold the stale attempt open: two independent delays only
+// ever *tend* to produce "stale finalizes after the winner" -- they don't
+// guarantee it, especially under CI load. The gate makes the ordering exact.
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { submitImageJob } from "../../src/api/submitImageJob.js";
 import { getJobById, listJobAttempts } from "../../src/db/jobsRepo.js";
-import { createTestHarness, sampleImageBuffer, waitFor, type TestHarness } from "./setup.js";
+import { createGate, createTestHarness, sampleImageBuffer, waitFor, type TestHarness } from "./setup.js";
 
 describe("attempt ownership (fencing token)", () => {
   let harness: TestHarness;
@@ -36,74 +41,61 @@ describe("attempt ownership (fencing token)", () => {
   });
 
   it("blocks a still-alive, lock-expired attempt from finalizing a job its replacement has already re-claimed", async () => {
-    // `slow` with no `onlyOnAttempt` applies to every attempt: attempt 1
-    // (the soon-to-be-abandoned worker) and attempt 2 (its recovery) both
-    // sleep for the full delay. That guarantees a window where attempt 2 has
-    // already re-entered 'running' (overwriting the fencing token) while
-    // attempt 1's own delayed finalize is still in flight and about to land.
     const { job } = await submitImageJob(
       { pool: harness.pool, dispatcher: harness.dispatcher, storagePaths: harness.storagePaths, maxJobAttempts: harness.config.MAX_JOB_ATTEMPTS },
-      {
-        idempotencyKey: randomUUID(),
-        file: { buffer: image, originalname: "slow-both.jpg" },
-        isDemo: true,
-        fault: { mode: "slow", delayMs: 1500 },
-      },
+      { idempotencyKey: randomUUID(), file: { buffer: image, originalname: "gate.jpg" }, isDemo: true },
     );
 
-    const { worker: staleWorker, connection: staleConnection } = harness.startWorker("demo");
+    // Held closed until step 4 below.
+    const staleGate = createGate();
+    const { worker: staleWorker, connection: staleConnection } = harness.startWorker("demo", {}, { beforeSuccessCommit: staleGate.wait });
 
+    // 1. The stale attempt does its real work (fully generates and closes
+    //    its thumbnails) and reaches the pre-commit boundary -- files done,
+    //    about to call transitionToSucceeded -- then blocks on the gate.
     await waitFor(async () => (await getJobById(harness.pool, job.id))?.status === "running");
-    const afterFirstClaim = await getJobById(harness.pool, job.id);
-    const firstToken = afterFirstClaim?.running_token;
+    const firstToken = (await getJobById(harness.pool, job.id))?.running_token;
     expect(firstToken).toBeTruthy();
 
-    // Sever the connection *without* closing the worker cleanly (no
-    // worker.close()) -- the worker process is, from BullMQ's point of view,
-    // gone: it stops renewing its lock. But its already-running processJob()
-    // call (including the in-flight `slow` setTimeout) keeps executing in
-    // this same Node process regardless, exactly like a worker whose event
-    // loop is merely stalled rather than actually dead.
+    // 2. "Crash" it: sever its connection without a graceful close, so it
+    //    stops renewing its lock. Its call stack -- parked on the gate --
+    //    is untouched by this, exactly like a worker whose event loop has
+    //    stalled but hasn't actually exited.
     staleConnection.disconnect();
     void staleWorker.close(true).catch(() => {});
 
-    // The recovering worker picks the job up once the stalled-job check
-    // fires and re-enters 'running', claiming a fresh token.
-    const recoveryClaimedAt = Date.now();
+    // 3. The recovery worker picks the job up once BullMQ's stalled-job
+    //    check fires, and completes it normally -- no gate on this one.
     harness.startWorker("demo");
+    await waitFor(async () => (await getJobById(harness.pool, job.id))?.status === "succeeded", 10_000);
+    const winner = await getJobById(harness.pool, job.id);
+    expect(winner?.running_token).not.toBe(firstToken);
+    expect(winner?.result_attempt_token).toBe(winner?.running_token);
+
+    // 4. Only now release the stale attempt -- this *guarantees*, rather
+    //    than merely makes likely, that its transitionToSucceeded call
+    //    lands strictly after the winner's.
+    staleGate.release();
+
     await waitFor(async () => {
-      const row = await getJobById(harness.pool, job.id);
-      return row?.status === "running" && row.running_token !== firstToken;
+      const attempts = await listJobAttempts(harness.pool, job.id);
+      return attempts.length === 2 && attempts.every((a) => a.status === "succeeded");
     });
 
-    // At this point: attempt 1's finalize (still queued behind its own
-    // setTimeout, holding the *old* token) has not landed yet, and attempt 2
-    // is itself still sleeping through its own `slow` fault. Neither attempt
-    // has reached a terminal state -- this is exactly the non-terminal race
-    // window the old status-only guard couldn't arbitrate.
-    const midway = await getJobById(harness.pool, job.id);
-    expect(midway?.status).toBe("running");
+    // The critical assertion: the stale attempt's finalize call, landing
+    // deterministically after the winner's, must not have been able to
+    // touch the job row at all.
+    const afterStaleFinalize = await getJobById(harness.pool, job.id);
+    expect(afterStaleFinalize?.status).toBe("succeeded");
+    expect(afterStaleFinalize?.running_token).toBe(winner?.running_token);
+    expect(afterStaleFinalize?.result_attempt_token).toBe(winner?.result_attempt_token);
+    expect(afterStaleFinalize?.result).toEqual(winner?.result);
 
-    await waitFor(async () => (await getJobById(harness.pool, job.id))?.status === "succeeded", 10_000);
-    const final = await getJobById(harness.pool, job.id);
-    expect(final?.status).toBe("succeeded");
-
-    // The critical assertion: the job only ever finished once the recovering
-    // attempt's own (slow) work actually completed -- roughly one fault
-    // delay after it claimed ownership. Attempt 1's finalize landed earlier
-    // than that (its setTimeout started well before attempt 2's), so if the
-    // old status-only guard had let it win, `finished_at` would sit far
-    // closer to `recoveryClaimedAt` than a full fault delay allows.
-    const finishedAfterClaimMs = final!.finished_at!.getTime() - recoveryClaimedAt;
-    expect(finishedAfterClaimMs).toBeGreaterThanOrEqual(1200);
-
+    // Two distinct worker processes actually ran this job -- confirming
+    // this was a genuine ownership race between two live attempts, not
+    // just a dead worker whose write bounced off an already-terminal row.
     const attempts = await listJobAttempts(harness.pool, job.id);
-    expect(attempts).toHaveLength(2);
     const workerIds = new Set(attempts.map((a) => a.worker_id));
-    // Two distinct worker processes actually ran this job -- attempt 1 (now
-    // stale) and attempt 2 (the recovery) -- confirming this was a genuine
-    // ownership race between two live attempts, not just a dead worker whose
-    // write bounced off an already-terminal row.
     expect(workerIds.size).toBe(2);
   }, 20_000);
 });

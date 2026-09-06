@@ -120,15 +120,14 @@ set on a normal submission.
 
 ### Storage
 
-Uploaded originals live at `STORAGE_DIR/uploads/<jobId>.upload`; the
-publicly-served, canonical thumbnails at
-`STORAGE_DIR/results/<jobId>/<small|medium|large>.jpg` -- that second path is
-a fixed public contract (`GET /files/results/:jobId/:label.jpg`, see
-docs/API.md) and only ever holds one attempt's output at a time: the one
-that won the ownership check below. Both the API (writes the upload) and
-every worker (reads the upload, writes results) need to see the same
-`STORAGE_DIR` -- on one machine that's just a shared path, which is what
-this project assumes throughout. The moment the API and workers run on
+Uploaded originals live at `STORAGE_DIR/uploads/<jobId>.upload`. There is no
+fixed, job-scoped path for a job's *result* -- see "Attempt isolation"
+immediately below for why -- so `GET /files/results/:jobId/:label.jpg` (the
+public URL contract, see docs/API.md) is resolved dynamically on every
+request rather than pointing at one assumed location. Both the API (writes
+the upload) and every worker (reads the upload, writes results) need to see
+the same `STORAGE_DIR` -- on one machine that's just a shared path, which is
+what this project assumes throughout. The moment the API and workers run on
 *different* machines, this stops being true: you'd need either a network
 filesystem, or (more realistically for most real deployments) to swap local
 disk for an object store (S3-compatible) and have workers fetch/upload by
@@ -136,24 +135,38 @@ key instead of by path. Nothing else about the architecture changes --
 `src/storage/paths.ts` is the one module that would need a different
 implementation.
 
-**Attempt isolation.** A worker never writes a thumbnail directly to that
-canonical path. It writes to `STORAGE_DIR/results/_attempts/<jobId>/<running_token>/`
--- a directory unique to *this attempt* -- and only moves (`rename`, a single
-directory-entry swap, not a copy) that directory into the canonical location
-once `transitionToSucceeded` confirms this attempt actually won the
-ownership check (`running_token` -- see
-[docs/FAILURE_SCENARIOS.md](FAILURE_SCENARIOS.md) "Worker crash mid-job, and
-recovery"). This matters for the same reason the ownership token does: a worker whose
+**Attempt isolation.** A worker writes each attempt's thumbnails to
+`STORAGE_DIR/results/_attempts/<jobId>/<running_token>/` -- a directory
+unique to *this attempt* -- and that directory is never moved. Once
+`transitionToSucceeded` confirms an attempt actually won the ownership check
+(`running_token` -- see [docs/FAILURE_SCENARIOS.md](FAILURE_SCENARIOS.md)
+"Worker crash mid-job, and recovery"), the *same guarded UPDATE* also writes
+`jobs.result_attempt_token = running_token` (004_result_attempt_token.sql):
+a durable, one-time pointer to which attempt's directory is authoritative.
+`GET /files/results/:jobId/:label.jpg` (`api/routes/files.ts`) looks up that
+column in Postgres on every request and serves straight from that one
+directory.
+
+This matters for the same reason the ownership token does: a worker whose
 lock merely expired can still be alive and still writing files well after a
-recovering attempt has taken over, and two attempts writing the *same* path
-concurrently would let whichever one finishes its disk I/O last silently
-overwrite the other's files -- regardless of which one Postgres says
-actually owns the result. A losing (or errored) attempt's directory is
-deleted (`discardAttemptResult`) the moment it's known to have lost; the
-retention sweep also removes any `_attempts/<jobId>` leftovers as a backstop
-for a process that crashed between generating files and resolving ownership.
-See `src/db/migrations/003_attempt_ownership.sql`,
-`src/storage/paths.ts`, and `test/integration/attemptIsolation.test.ts`.
+recovering attempt has taken over. Writing every attempt to *and moving it
+into* one shared path would let whichever attempt touched disk last --
+including a promotion step -- silently win, regardless of which one Postgres
+says actually owns the result. Never moving anything removes that race
+entirely: a losing (or errored) attempt's directory is deleted outright
+instead (`discardAttemptResult`), and the winner's directory is never
+touched by anything but the retention sweep, which is also what "preserve
+winning files until retention expires" means in practice -- nothing deletes
+the winner's directory early, and nothing deletes it late either, since
+`deleteJobFiles` removes the entire `_attempts/<jobId>` tree (winner
+included) the moment the job is past `RETENTION_MINUTES`. That same sweep is
+also the backstop for an attempt that crashed *before* ever resolving
+ownership: its orphaned directory has nothing pointing at it, and outlives
+the job only until the next retention pass. See
+`src/db/migrations/003_attempt_ownership.sql` and
+`004_result_attempt_token.sql`, `src/storage/paths.ts`,
+`src/api/routes/files.ts`, and
+`test/integration/{attemptIsolation,successCommitCrash}.test.ts`.
 
 ### Multi-tenant
 
@@ -232,12 +245,13 @@ fault spec read from the payload.
 7. The worker reads the uploaded file, validates it for real
    (`validateImageBuffer` in `src/jobs/thumbnails.ts` -- format, dimensions,
    pixel count), and generates three thumbnails into a directory unique to
-   *this attempt* (see "Attempt isolation" under Storage, above) -- never
-   directly to the job's canonical, publicly-served path.
+   *this attempt* (see "Attempt isolation" under Storage, above) -- files are
+   fully written and their handles closed before anything below runs.
 8. **Success**: `transitionToSucceeded`, guarded by both `status` and this
-   attempt's `running_token`. Only if that write actually succeeds does the
-   worker promote its attempt directory to the canonical path (`rename`);
-   if it lost the ownership race, it deletes its own directory instead and
+   attempt's `running_token`, also stamps `result_attempt_token` in that same
+   statement. If it actually wins, this attempt's directory simply *is* the
+   job's result now -- nothing is moved. If it lost the ownership race, the
+   worker deletes its own directory instead (`discardAttemptResult`) and
    discards its result. Either way the attempt row is marked `succeeded`,
    with a structured log noting job id/attempt/transition/duration.
    **Permanent failure** (bad input): `transitionToFailed` +

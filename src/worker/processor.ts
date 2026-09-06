@@ -19,7 +19,7 @@ import { applyFault, type FaultSpec } from "../faults/inject.js";
 import { metrics } from "../metrics/metrics.js";
 import type { Logger } from "../logger.js";
 import type { JobQueueData } from "../queue/queue.js";
-import { attemptThumbnailPathFor, discardAttemptResult, promoteAttemptResult, uploadPathFor, type StoragePaths } from "../storage/paths.js";
+import { attemptThumbnailPathFor, discardAttemptResult, uploadPathFor, type StoragePaths } from "../storage/paths.js";
 
 export interface ImageJobPayload {
   /** Display-only, sanitized client-supplied filename. Never used to build a filesystem path. */
@@ -40,6 +40,27 @@ export interface ProcessorDeps {
   /** Called right before/after processing so the worker can heartbeat its busy/idle status against the set of jobs it actually has in flight. */
   onJobStart?: (jobId: string) => void;
   onJobEnd?: (jobId: string) => void;
+  /**
+   * Test-only seams -- never set by worker.ts in production. Real crash
+   * timing can't be pinned to an exact line by racing two independent
+   * delays (that only ever *tends* to produce a given ordering); these let
+   * a test deterministically hold an attempt open at the two moments that
+   * matter most for correctness, so it can assert on state at that exact
+   * point before choosing whether the attempt ever proceeds:
+   *
+   * - `beforeSuccessCommit`: this attempt's thumbnails are fully generated,
+   *   written, and closed, but `transitionToSucceeded` has not yet been
+   *   called. A test never releasing this simulates "the process is gone
+   *   the instant before the success update" -- see
+   *   test/integration/successCommitCrash.test.ts.
+   * - `afterSuccessCommit`: `transitionToSucceeded` has just resolved
+   *   (whichever way). A test never releasing this simulates "the process
+   *   is gone the instant after the success update," while everything a
+   *   client could observe (the DB row, the winning files) is already
+   *   durably in place.
+   */
+  beforeSuccessCommit?: () => Promise<void> | void;
+  afterSuccessCommit?: () => Promise<void> | void;
 }
 
 export function makeProcessor(deps: ProcessorDeps) {
@@ -102,13 +123,16 @@ export function makeProcessor(deps: ProcessorDeps) {
         // format/dimensions are authoritatively checked (see
         // src/jobs/thumbnails.ts). A bad file fails here, permanently.
         //
-        // Every attempt writes into its own directory, keyed by its own
-        // runningToken -- never the shared, publicly-served location. A
-        // stale-but-still-alive attempt (see docs/FAILURE_SCENARIOS.md
+        // Every attempt writes into, and stays in, its own directory, keyed
+        // by its own runningToken -- never a shared, job-scoped location.
+        // A stale-but-still-alive attempt (see docs/FAILURE_SCENARIOS.md
         // "Stale attempt") can keep writing here for as long as it likes
         // without any chance of corrupting or racing the actual winner's
-        // files; only transitionToSucceeded winning below promotes a
-        // directory to where /files/results/:jobId/:label.jpg serves from.
+        // files: there is nothing to race, because nothing ever moves.
+        // Whichever attempt wins the ownership check below has its files
+        // served directly from here -- see the download endpoint,
+        // api/routes/files.ts, which looks up `result_attempt_token` in
+        // Postgres to find this exact directory.
         const { metadata, thumbnails } = await generateThumbnails(
           sourcePath,
           (label) => attemptThumbnailPathFor(deps.storagePaths, jobId, runningToken, label),
@@ -130,14 +154,22 @@ export function makeProcessor(deps: ProcessorDeps) {
           })),
         };
 
-        // The database decides the winner first -- only once this
-        // ownership-checked write actually succeeds do this attempt's files
-        // get promoted to the location its own `result.thumbnails[].url`
-        // values point at. Deciding filesystem placement before the DB
-        // write is confirmed would risk publishing a loser's files (or
-        // clobbering a genuine winner's) if two attempts raced each other
-        // to promote at the same time.
+        // Every file is fully written and its handle closed by the time
+        // generateThumbnails above resolves (sharp's .toFile() only
+        // resolves once its write stream has finished and closed) -- so by
+        // this point there is nothing left to flush. Success is only ever
+        // committed after that is true; this ordering is exactly what lets
+        // the success DB row and the winning files be treated as a single
+        // durable fact once transitionToSucceeded below returns a row.
+        await deps.beforeSuccessCommit?.();
+
+        // The database decides the winner first, and permanently: this
+        // attempt's directory is never moved anywhere afterward. If this
+        // write succeeds, `result_attempt_token` (set by transitionToSucceeded
+        // itself, in the same statement) becomes the durable pointer to
+        // this exact directory -- that's what the download endpoint reads.
         const succeeded = await transitionToSucceeded(deps.pool, jobId, result, attemptNumber, runningToken);
+        await deps.afterSuccessCommit?.();
         const durationMs = Date.now() - startedAt;
         // This attempt's own history entry reflects what actually happened
         // to it, independent of whether it won the job-level race below.
@@ -147,14 +179,15 @@ export function makeProcessor(deps: ProcessorDeps) {
           // replacement, spun up after BullMQ decided our lock had expired)
           // already claimed 'running' again and will finalize the job
           // itself. Don't overwrite whatever it eventually writes -- and
-          // clean up the thumbnails we generated, since they'll never be
-          // served from anywhere.
+          // clean up the thumbnails we generated, since nothing will ever
+          // point at this directory now.
           await discardAttemptResult(deps.storagePaths, jobId, runningToken);
           const latest = await getJobById(deps.pool, jobId);
           deps.logger.warn({ jobId, attempt: attemptNumber }, "completed work but lost attempt-ownership race; discarding this attempt's files and job-level result");
           return latest?.result ?? result;
         }
-        await promoteAttemptResult(deps.storagePaths, jobId, runningToken);
+        // Nothing to move: this attempt's directory *is* the published
+        // result now, permanently, until retention purges the whole job.
         metrics.recordCompleted();
         metrics.recordProcessingMs(durationMs);
         deps.logger.info({ jobId, attempt: attemptNumber, transition: "running -> succeeded", durationMs }, "job succeeded");

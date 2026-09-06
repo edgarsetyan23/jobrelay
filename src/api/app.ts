@@ -53,7 +53,7 @@ export function createApp(deps: AppDeps): Express {
 
   app.use(jobsRouter({ pool: deps.pool, dispatcher: deps.dispatcher, storagePaths: deps.storagePaths, maxJobAttempts: deps.config.MAX_JOB_ATTEMPTS, maxUploadBytes: deps.config.MAX_UPLOAD_BYTES }));
   app.use(workersRouter({ pool: deps.pool, offlineThresholdMs: deps.config.WORKER_OFFLINE_THRESHOLD_MS }));
-  app.use(filesRouter({ storagePaths: deps.storagePaths }));
+  app.use(filesRouter({ pool: deps.pool, storagePaths: deps.storagePaths }));
 
   if (deps.config.DEMO_ENABLED && deps.demoWorkers) {
     app.use(

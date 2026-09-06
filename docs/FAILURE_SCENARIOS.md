@@ -15,6 +15,8 @@ demo" columns say exactly that -- nothing here is aspirational.
 | Worker crash mid-job, recovery | yes | `crashRecovery.test.ts`, `demoPanel.test.ts` (real process) | "Stop this worker" |
 | Stale (lock-expired but still alive) attempt can't finalize over its replacement | yes | `attemptOwnership.test.ts` | -- |
 | Stale attempt's file writes can't corrupt the winner's published downloads | yes | `attemptIsolation.test.ts` | -- |
+| Crash immediately before the success update | yes | `successCommitCrash.test.ts` | -- |
+| Crash immediately after the success update | yes | `successCommitCrash.test.ts` | -- |
 | Redis unavailable after Postgres accept, then recovery | yes | `redisOutage.test.ts` | -- |
 | Duplicate delivery -> one authoritative result | yes | `duplicateDelivery.test.ts` | -- |
 | Graceful shutdown (API and worker) | yes | manual (see below) | -- |
@@ -152,20 +154,56 @@ above stops a stale attempt from overwriting the job's *database* row, but
 that attempt is still a real, running process that keeps calling
 `sharp(...).toFile(...)` for as long as its own work takes -- nothing stops
 it from writing to disk. If every attempt generated thumbnails at the same
-`STORAGE_DIR/results/<jobId>/` path, a stale attempt finishing its disk I/O
-after the winner had already published would silently overwrite (or, worse,
-partially overwrite mid-write) the exact files a visitor might be
+path -- even a shared path a "winner" only got promoted into after the fact
+-- a stale attempt finishing its disk I/O (or its own promotion) after the
+real winner had already published could still silently overwrite (or,
+worse, partially overwrite mid-write) the exact files a visitor might be
 downloading at that moment, regardless of what Postgres says. To close that
-gap, every attempt writes into its own directory,
-`STORAGE_DIR/results/_attempts/<jobId>/<running_token>/`, and only the
-attempt that wins `transitionToSucceeded` gets its directory `rename`d into
-the canonical, publicly-served path (`promoteAttemptResult` in
-`src/storage/paths.ts`) -- a losing attempt's directory is deleted instead
-(`discardAttemptResult`), whether it lost the race after succeeding or
-failed outright. `test/integration/attemptIsolation.test.ts` proves this
-directly: it lets a stale attempt keep writing well after the winner has
-already published, then re-downloads the winner's thumbnails and checks
-them byte-for-byte against what was downloaded right after publication.
+gap, every attempt writes into, and *stays in*, its own directory,
+`STORAGE_DIR/results/_attempts/<jobId>/<running_token>/` -- there is no
+promotion step at all. The same guarded UPDATE that wins `transitionToSucceeded`
+also stamps `jobs.result_attempt_token` (`004_result_attempt_token.sql`) with
+that attempt's token, and the download endpoint (`api/routes/files.ts`)
+looks that column up on every request rather than assuming a fixed path. A
+losing attempt's directory is deleted instead (`discardAttemptResult`),
+whether it lost the race after succeeding or failed outright.
+`test/integration/attemptIsolation.test.ts` proves this directly: a
+manually-controlled gate (not a timed delay -- see below) holds a stale
+attempt open until the winner has *already* finished and published, then
+releases it and confirms the winner's downloads are still byte-for-byte
+identical to what was downloaded right after publication.
+
+**Pinning a crash to an exact instant:** the two tests above (and
+`successCommitCrash.test.ts`, below) don't use a `slow` fault with a fixed
+delay to create their overlapping-attempt windows. Two independent delays
+only ever *tend* to produce "the stale attempt's write lands after the
+winner's" -- they don't guarantee it, especially under load. Instead,
+`worker/processor.ts`'s `ProcessorDeps` exposes two test-only seams,
+`beforeSuccessCommit` and `afterSuccessCommit`, that a test wires to a
+manually-controlled gate (`createGate()` in `test/integration/setup.ts`): the
+attempt blocks there until the test explicitly releases it, which it only
+does once it has already confirmed whatever needs to happen first actually
+happened. Production code (`worker.ts`) never sets these -- they're `?.()`-
+guarded no-ops unless a test supplies them.
+
+**`successCommitCrash.test.ts`** pins a simulated crash to the two instants
+immediately before and immediately after the success database write:
+
+- *Before*: an attempt's files are fully generated and closed, then it
+  blocks forever on `beforeSuccessCommit` -- simulating a crash that means
+  `transitionToSucceeded` never runs for this attempt at all. A replacement
+  attempt takes over normally and publishes the result; the crashed
+  attempt's orphaned directory is left exactly where it was (it never got
+  the chance to clean up after itself) until the retention sweep removes it,
+  proving that backstop concretely rather than just asserting it exists.
+- *After*: `transitionToSucceeded` resolves (the row is durably `succeeded`,
+  `result_attempt_token` is set, the files are already in place), then the
+  attempt blocks forever on `afterSuccessCommit` -- simulating a crash the
+  instant after commit, before this attempt's own bookkeeping
+  (`recordAttemptEnd`, metrics, its log line) ever runs. A subsequent
+  stalled-job redelivery of the *same* BullMQ job hits the duplicate-delivery
+  guard at the very top of `processJob` and returns the stored result
+  untouched -- no new `job_attempts` row, no re-generated files.
 
 **Graceful vs. crash, and what changes:** `worker.close()` (called on
 `SIGINT`/`SIGTERM` in `worker.ts`) stops accepting new jobs and waits for

@@ -7,9 +7,8 @@ Read in this order; each step builds on the last.
 1. **`src/config.ts`** -- every setting the system has, with defaults and
    comments explaining *why* each one is what it is. Skimming this tells you
    the shape of the whole system before reading a line of logic.
-2. **`src/db/migrations/001_init.sql`**, **`002_workshop.sql`**, and
-   **`003_attempt_ownership.sql`** -- the schema is the ground truth for what
-   state the system tracks.
+2. **`src/db/migrations/001_init.sql`** through **`004_result_attempt_token.sql`**
+   -- the schema is the ground truth for what state the system tracks.
 3. **`src/db/jobsRepo.ts`** -- every read/write of that schema, in one file.
    Read `createJobWithOutbox` first (idempotency + outbox in one
    transaction), then the `transitionTo*` functions (the guarded state
@@ -99,13 +98,20 @@ from `attemptsMade`.
 The same `runningToken` also isolates *files*, not just the database row:
 `generateThumbnails` is pointed at
 `attemptThumbnailPathFor(storagePaths, jobId, runningToken, label)` -- a
-directory unique to this attempt -- never the job's canonical, publicly-served
-path directly. Only after `transitionToSucceeded` confirms this attempt won
-does `processJob` call `promoteAttemptResult` to `rename` that directory into
-place; a losing or errored attempt calls `discardAttemptResult` instead. This
-is what stops a stale-but-still-alive attempt from overwriting (or
-partially overwriting mid-write) a winner's already-published thumbnails --
-see `test/integration/attemptIsolation.test.ts` and the "Attempt isolation"
+directory unique to this attempt, which it never leaves. There is no
+promotion step: if `transitionToSucceeded` confirms this attempt won, that
+same guarded UPDATE also stamps `result_attempt_token = runningToken` --
+this attempt's directory simply *is* the job's result from then on, until
+retention purges it. A losing or errored attempt calls `discardAttemptResult`
+instead, deleting its directory outright. The download endpoint
+(`api/routes/files.ts`) looks up `result_attempt_token` in Postgres on every
+request and serves straight from that attempt's directory -- there's no
+fixed, job-scoped path it could instead assume. This is what stops a
+stale-but-still-alive attempt from overwriting (or partially overwriting
+mid-write) a winner's already-published thumbnails: there's nothing to
+overwrite, because nothing the winner wrote ever moves. See
+`test/integration/attemptIsolation.test.ts`,
+`test/integration/successCommitCrash.test.ts`, and the "Attempt isolation"
 part of docs/ARCHITECTURE.md's Storage section.
 
 ### `makeBackoffStrategy` (`src/queue/backoff.ts`)
@@ -165,6 +171,14 @@ Try answering these from memory, then check your answer against the code.
     rather than a single `currentJobId` variable. Construct a concrete
     sequence of events with `WORKER_CONCURRENCY=2` where the single-variable
     version reports `idle` while a job is still actually running.
+13. `jobs` has both `running_token` and `result_attempt_token`. Why can't one
+    column do both jobs? (Hint: what does `running_token` do on every
+    `running -> running` re-entry that `result_attempt_token` must never do
+    once a job has succeeded?)
+14. There's no `promoteAttemptResult` function -- a winning attempt's files
+    never move. What would have to be true for a "promote the winner's
+    directory into a shared, job-scoped path" design to be just as safe as
+    the current one? Why is that harder to guarantee than it sounds?
 
 ## Exercises
 

@@ -15,7 +15,7 @@ import { upsertWorkerHeartbeat, deleteWorker, type WorkerKind } from "../../src/
 import type { JobQueueData } from "../../src/queue/queue.js";
 import { createQueueSet, type QueueSet } from "../../src/queue/queue.js";
 import { makeBackoffStrategy } from "../../src/queue/backoff.js";
-import { makeProcessor } from "../../src/worker/processor.js";
+import { makeProcessor, type ProcessorDeps } from "../../src/worker/processor.js";
 import { startOutboxSweeper, type DispatcherDeps } from "../../src/outbox/dispatcher.js";
 import { resolveStoragePaths, ensureStorageDirs, type StoragePaths } from "../../src/storage/paths.js";
 import { logger } from "../../src/logger.js";
@@ -61,6 +61,9 @@ export const testConfig: Config = {
   WORKER_ID_OVERRIDE: undefined,
 };
 
+/** The two test-only crash-simulation seams on ProcessorDeps -- see the doc comment on ProcessorDeps itself in worker/processor.ts. */
+export type ProcessorTestHooks = Pick<ProcessorDeps, "beforeSuccessCommit" | "afterSuccessCommit">;
+
 export interface TestHarness {
   config: Config;
   pool: Pool;
@@ -69,8 +72,12 @@ export interface TestHarness {
   dispatcher: DispatcherDeps;
   sweeper: { stop: () => void };
   storagePaths: StoragePaths;
-  /** Starts a fresh worker (its own Redis connection, its own worker id). Caller must close it. */
-  startWorker: (kind: WorkerKind, overrides?: Partial<Config>) => { worker: Worker<JobQueueData>; workerId: string; connection: Redis };
+  /** Starts a fresh worker (its own Redis connection, its own worker id). Caller must close it. `processorHooks` wires up the crash-simulation test seams on ProcessorDeps -- see successCommitCrash.test.ts. */
+  startWorker: (
+    kind: WorkerKind,
+    overrides?: Partial<Config>,
+    processorHooks?: Partial<ProcessorTestHooks>,
+  ) => { worker: Worker<JobQueueData>; workerId: string; connection: Redis };
   cleanup: () => Promise<void>;
 }
 
@@ -100,7 +107,7 @@ export async function createTestHarness(configOverrides: Partial<Config> = {}): 
 
   const workers: Array<{ worker: Worker<JobQueueData>; connection: Redis; workerId: string }> = [];
 
-  function startWorker(kind: WorkerKind, overrides: Partial<Config> = {}) {
+  function startWorker(kind: WorkerKind, overrides: Partial<Config> = {}, processorHooks: Partial<ProcessorTestHooks> = {}) {
     const workerConfig = { ...config, ...overrides };
     const workerId = `test-${kind}-${randomUUID().slice(0, 8)}`;
     const queueName = kind === "demo" ? workerConfig.DEMO_QUEUE_NAME : workerConfig.MAIN_QUEUE_NAME;
@@ -130,6 +137,7 @@ export async function createTestHarness(configOverrides: Partial<Config> = {}): 
         activeJobIds.delete(jobId);
         void heartbeat();
       },
+      ...processorHooks,
     });
     const worker = new Worker<JobQueueData>(queueName, processor, {
       connection,
@@ -167,6 +175,29 @@ export async function createTestHarness(configOverrides: Partial<Config> = {}): 
   }
 
   return { config, pool, apiRedis, queues, dispatcher, sweeper, storagePaths, startWorker, cleanup };
+}
+
+export interface Gate {
+  /** Resolves once `release()` has been called (or immediately, if it already has). */
+  wait: () => Promise<void>;
+  release: () => void;
+}
+
+/**
+ * A manually-controlled latch for deterministically ordering two attempts in
+ * a test. Racing two independent `setTimeout` delays only ever *tends* to
+ * produce a given ordering -- it doesn't guarantee it, especially under CI
+ * load. Wiring this into a worker's `beforeSuccessCommit` (or
+ * `afterSuccessCommit`) test hook lets a test hold that attempt open at an
+ * exact point and release it only once it has already confirmed something
+ * else (like a replacement attempt succeeding) has happened.
+ */
+export function createGate(): Gate {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { wait: () => promise, release };
 }
 
 /** Waits until `predicate()` resolves truthy, polling every `intervalMs`, up to `timeoutMs`. */
