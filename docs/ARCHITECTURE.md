@@ -120,17 +120,40 @@ set on a normal submission.
 
 ### Storage
 
-Uploaded originals live at `STORAGE_DIR/uploads/<jobId>.upload`; generated
-thumbnails at `STORAGE_DIR/results/<jobId>/<small|medium|large>.jpg`. Both
-the API (writes the upload) and every worker (reads the upload, writes
-results) need to see the same `STORAGE_DIR` -- on one machine that's just a
-shared path, which is what this project assumes throughout. The moment the
-API and workers run on *different* machines, this stops being true: you'd
-need either a network filesystem, or (more realistically for most real
-deployments) to swap local disk for an object store (S3-compatible) and have
-workers fetch/upload by key instead of by path. Nothing else about the
-architecture changes -- `src/storage/paths.ts` is the one module that would
-need a different implementation.
+Uploaded originals live at `STORAGE_DIR/uploads/<jobId>.upload`; the
+publicly-served, canonical thumbnails at
+`STORAGE_DIR/results/<jobId>/<small|medium|large>.jpg` -- that second path is
+a fixed public contract (`GET /files/results/:jobId/:label.jpg`, see
+docs/API.md) and only ever holds one attempt's output at a time: the one
+that won the ownership check below. Both the API (writes the upload) and
+every worker (reads the upload, writes results) need to see the same
+`STORAGE_DIR` -- on one machine that's just a shared path, which is what
+this project assumes throughout. The moment the API and workers run on
+*different* machines, this stops being true: you'd need either a network
+filesystem, or (more realistically for most real deployments) to swap local
+disk for an object store (S3-compatible) and have workers fetch/upload by
+key instead of by path. Nothing else about the architecture changes --
+`src/storage/paths.ts` is the one module that would need a different
+implementation.
+
+**Attempt isolation.** A worker never writes a thumbnail directly to that
+canonical path. It writes to `STORAGE_DIR/results/_attempts/<jobId>/<running_token>/`
+-- a directory unique to *this attempt* -- and only moves (`rename`, a single
+directory-entry swap, not a copy) that directory into the canonical location
+once `transitionToSucceeded` confirms this attempt actually won the
+ownership check (`running_token` -- see
+[docs/FAILURE_SCENARIOS.md](FAILURE_SCENARIOS.md) "Worker crash mid-job, and
+recovery"). This matters for the same reason the ownership token does: a worker whose
+lock merely expired can still be alive and still writing files well after a
+recovering attempt has taken over, and two attempts writing the *same* path
+concurrently would let whichever one finishes its disk I/O last silently
+overwrite the other's files -- regardless of which one Postgres says
+actually owns the result. A losing (or errored) attempt's directory is
+deleted (`discardAttemptResult`) the moment it's known to have lost; the
+retention sweep also removes any `_attempts/<jobId>` leftovers as a backstop
+for a process that crashed between generating files and resolving ownership.
+See `src/db/migrations/003_attempt_ownership.sql`,
+`src/storage/paths.ts`, and `test/integration/attemptIsolation.test.ts`.
 
 ### Multi-tenant
 
@@ -208,15 +231,22 @@ fault spec read from the payload.
    attempt row.
 7. The worker reads the uploaded file, validates it for real
    (`validateImageBuffer` in `src/jobs/thumbnails.ts` -- format, dimensions,
-   pixel count), and generates three thumbnails.
-8. **Success**: `transitionToSucceeded` (guarded the same way), attempt row
-   marked `succeeded`, structured log with job id/attempt/transition/duration.
+   pixel count), and generates three thumbnails into a directory unique to
+   *this attempt* (see "Attempt isolation" under Storage, above) -- never
+   directly to the job's canonical, publicly-served path.
+8. **Success**: `transitionToSucceeded`, guarded by both `status` and this
+   attempt's `running_token`. Only if that write actually succeeds does the
+   worker promote its attempt directory to the canonical path (`rename`);
+   if it lost the ownership race, it deletes its own directory instead and
+   discards its result. Either way the attempt row is marked `succeeded`,
+   with a structured log noting job id/attempt/transition/duration.
    **Permanent failure** (bad input): `transitionToFailed` +
    `UnrecoverableError`, so BullMQ never retries. **Transient failure**: if
    attempts remain, `transitionToRetrying` and a plain `Error` is thrown so
    BullMQ schedules a retry with jittered exponential backoff
    (`src/queue/backoff.ts`); if attempts are exhausted, `transitionToFailed`
-   with `"retries exhausted: ..."`.
+   with `"retries exhausted: ..."`. Every failure path also discards this
+   attempt's own (usually empty) output directory.
 9. The frontend, polling `GET /api/jobs` and `GET /api/jobs/:id/attempts`
    every ~1.5s, reflects each of these transitions as they happen -- there is
    no simulated progress anywhere in the UI.

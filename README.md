@@ -122,7 +122,7 @@ runnable worker process."
 
 ```
 npm run test:unit        -> 13 passed  (2 files)
-npm run test:integration -> 24 passed  (8 files, real Postgres + Redis;
+npm run test:integration -> 25 passed  (9 files, real Postgres + Redis;
                                          one test spawns and kills a real
                                          OS worker process)
 ```

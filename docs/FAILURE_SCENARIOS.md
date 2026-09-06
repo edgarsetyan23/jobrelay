@@ -14,6 +14,7 @@ demo" columns say exactly that -- nothing here is aspirational.
 | Retry exhaustion | yes | `retries.test.ts` | -- |
 | Worker crash mid-job, recovery | yes | `crashRecovery.test.ts`, `demoPanel.test.ts` (real process) | "Stop this worker" |
 | Stale (lock-expired but still alive) attempt can't finalize over its replacement | yes | `attemptOwnership.test.ts` | -- |
+| Stale attempt's file writes can't corrupt the winner's published downloads | yes | `attemptIsolation.test.ts` | -- |
 | Redis unavailable after Postgres accept, then recovery | yes | `redisOutage.test.ts` | -- |
 | Duplicate delivery -> one authoritative result | yes | `duplicateDelivery.test.ts` | -- |
 | Graceful shutdown (API and worker) | yes | manual (see below) | -- |
@@ -145,6 +146,26 @@ Another worker eventually picks the same job up and finishes it.
   attempt's finalize call is a guarded no-op instead of a race -- see
   `src/db/migrations/003_attempt_ownership.sql` and the fencing-token
   comment in `src/worker/processor.ts`.
+
+**File isolation, not just database isolation:** the `running_token` guard
+above stops a stale attempt from overwriting the job's *database* row, but
+that attempt is still a real, running process that keeps calling
+`sharp(...).toFile(...)` for as long as its own work takes -- nothing stops
+it from writing to disk. If every attempt generated thumbnails at the same
+`STORAGE_DIR/results/<jobId>/` path, a stale attempt finishing its disk I/O
+after the winner had already published would silently overwrite (or, worse,
+partially overwrite mid-write) the exact files a visitor might be
+downloading at that moment, regardless of what Postgres says. To close that
+gap, every attempt writes into its own directory,
+`STORAGE_DIR/results/_attempts/<jobId>/<running_token>/`, and only the
+attempt that wins `transitionToSucceeded` gets its directory `rename`d into
+the canonical, publicly-served path (`promoteAttemptResult` in
+`src/storage/paths.ts`) -- a losing attempt's directory is deleted instead
+(`discardAttemptResult`), whether it lost the race after succeeding or
+failed outright. `test/integration/attemptIsolation.test.ts` proves this
+directly: it lets a stale attempt keep writing well after the winner has
+already published, then re-downloads the winner's thumbnails and checks
+them byte-for-byte against what was downloaded right after publication.
 
 **Graceful vs. crash, and what changes:** `worker.close()` (called on
 `SIGINT`/`SIGTERM` in `worker.ts`) stops accepting new jobs and waits for

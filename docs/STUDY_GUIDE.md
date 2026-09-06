@@ -7,8 +7,9 @@ Read in this order; each step builds on the last.
 1. **`src/config.ts`** -- every setting the system has, with defaults and
    comments explaining *why* each one is what it is. Skimming this tells you
    the shape of the whole system before reading a line of logic.
-2. **`src/db/migrations/001_init.sql`** and **`002_workshop.sql`** -- the
-   schema is the ground truth for what state the system tracks.
+2. **`src/db/migrations/001_init.sql`**, **`002_workshop.sql`**, and
+   **`003_attempt_ownership.sql`** -- the schema is the ground truth for what
+   state the system tracks.
 3. **`src/db/jobsRepo.ts`** -- every read/write of that schema, in one file.
    Read `createJobWithOutbox` first (idempotency + outbox in one
    transaction), then the `transitionTo*` functions (the guarded state
@@ -21,7 +22,8 @@ Read in this order; each step builds on the last.
    story referenced everywhere else.
 6. **`src/api/submitImageJob.ts`** then **`src/api/routes/jobs.ts`** -- how a
    request becomes a job.
-7. **`src/worker/processor.ts`** -- the other half of a job's life. This is
+7. **`src/worker/processor.ts`**, alongside **`src/storage/paths.ts`**'s
+   "Attempt isolation" functions -- the other half of a job's life. This is
    the single most important file to understand deeply; every reliability
    guarantee in the project is enforced somewhere in this function.
 8. **`src/worker/worker.ts`** -- how a processor becomes a running BullMQ
@@ -93,6 +95,18 @@ in a stall-recovery scenario -- it isn't incremented just because a stalled
 job was redelivered, only when an attempt actually threw -- which is exactly
 why `runningToken` is a fresh random value per attempt rather than derived
 from `attemptsMade`.
+
+The same `runningToken` also isolates *files*, not just the database row:
+`generateThumbnails` is pointed at
+`attemptThumbnailPathFor(storagePaths, jobId, runningToken, label)` -- a
+directory unique to this attempt -- never the job's canonical, publicly-served
+path directly. Only after `transitionToSucceeded` confirms this attempt won
+does `processJob` call `promoteAttemptResult` to `rename` that directory into
+place; a losing or errored attempt calls `discardAttemptResult` instead. This
+is what stops a stale-but-still-alive attempt from overwriting (or
+partially overwriting mid-write) a winner's already-published thumbnails --
+see `test/integration/attemptIsolation.test.ts` and the "Attempt isolation"
+part of docs/ARCHITECTURE.md's Storage section.
 
 ### `makeBackoffStrategy` (`src/queue/backoff.ts`)
 

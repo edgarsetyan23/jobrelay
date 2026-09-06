@@ -19,7 +19,7 @@ import { applyFault, type FaultSpec } from "../faults/inject.js";
 import { metrics } from "../metrics/metrics.js";
 import type { Logger } from "../logger.js";
 import type { JobQueueData } from "../queue/queue.js";
-import { thumbnailPathFor, uploadPathFor, type StoragePaths } from "../storage/paths.js";
+import { attemptThumbnailPathFor, discardAttemptResult, promoteAttemptResult, uploadPathFor, type StoragePaths } from "../storage/paths.js";
 
 export interface ImageJobPayload {
   /** Display-only, sanitized client-supplied filename. Never used to build a filesystem path. */
@@ -101,7 +101,19 @@ export function makeProcessor(deps: ProcessorDeps) {
         // actual bytes on disk -- this is the one and only place image
         // format/dimensions are authoritatively checked (see
         // src/jobs/thumbnails.ts). A bad file fails here, permanently.
-        const { metadata, thumbnails } = await generateThumbnails(sourcePath, (label) => thumbnailPathFor(deps.storagePaths, jobId, label), deps.imageLimits);
+        //
+        // Every attempt writes into its own directory, keyed by its own
+        // runningToken -- never the shared, publicly-served location. A
+        // stale-but-still-alive attempt (see docs/FAILURE_SCENARIOS.md
+        // "Stale attempt") can keep writing here for as long as it likes
+        // without any chance of corrupting or racing the actual winner's
+        // files; only transitionToSucceeded winning below promotes a
+        // directory to where /files/results/:jobId/:label.jpg serves from.
+        const { metadata, thumbnails } = await generateThumbnails(
+          sourcePath,
+          (label) => attemptThumbnailPathFor(deps.storagePaths, jobId, runningToken, label),
+          deps.imageLimits,
+        );
 
         const result = {
           originalFilename: payload.originalFilename,
@@ -118,6 +130,13 @@ export function makeProcessor(deps: ProcessorDeps) {
           })),
         };
 
+        // The database decides the winner first -- only once this
+        // ownership-checked write actually succeeds do this attempt's files
+        // get promoted to the location its own `result.thumbnails[].url`
+        // values point at. Deciding filesystem placement before the DB
+        // write is confirmed would risk publishing a loser's files (or
+        // clobbering a genuine winner's) if two attempts raced each other
+        // to promote at the same time.
         const succeeded = await transitionToSucceeded(deps.pool, jobId, result, attemptNumber, runningToken);
         const durationMs = Date.now() - startedAt;
         // This attempt's own history entry reflects what actually happened
@@ -127,11 +146,15 @@ export function makeProcessor(deps: ProcessorDeps) {
           // Lost the fencing-token race: a newer attempt (our own
           // replacement, spun up after BullMQ decided our lock had expired)
           // already claimed 'running' again and will finalize the job
-          // itself. Don't overwrite whatever it eventually writes.
+          // itself. Don't overwrite whatever it eventually writes -- and
+          // clean up the thumbnails we generated, since they'll never be
+          // served from anywhere.
+          await discardAttemptResult(deps.storagePaths, jobId, runningToken);
           const latest = await getJobById(deps.pool, jobId);
-          deps.logger.warn({ jobId, attempt: attemptNumber }, "completed work but lost attempt-ownership race; discarding this attempt's job-level result");
+          deps.logger.warn({ jobId, attempt: attemptNumber }, "completed work but lost attempt-ownership race; discarding this attempt's files and job-level result");
           return latest?.result ?? result;
         }
+        await promoteAttemptResult(deps.storagePaths, jobId, runningToken);
         metrics.recordCompleted();
         metrics.recordProcessingMs(durationMs);
         deps.logger.info({ jobId, attempt: attemptNumber, transition: "running -> succeeded", durationMs }, "job succeeded");
@@ -139,6 +162,13 @@ export function makeProcessor(deps: ProcessorDeps) {
       } catch (err) {
         const durationMs = Date.now() - startedAt;
         const message = err instanceof Error ? err.message : String(err);
+        // No failure path ever publishes a result, so this attempt's output
+        // directory (typically empty -- both the fault hook and
+        // validateImageBuffer throw before any thumbnail file is written,
+        // but a failure partway through the resize loop could leave a
+        // partial one behind) never should either. Safe even if nothing was
+        // ever written.
+        await discardAttemptResult(deps.storagePaths, jobId, runningToken);
 
         if (err instanceof ValidationError) {
           const failed = await transitionToFailed(deps.pool, jobId, message, attemptNumber, runningToken);
