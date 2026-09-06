@@ -24,6 +24,8 @@ export interface JobRow {
   updated_at: Date;
   started_at: Date | null;
   finished_at: Date | null;
+  /** Fencing token stamped by the attempt currently entitled to finalize this job -- see transitionToRunning. */
+  running_token: string | null;
 }
 
 export interface OutboxRow {
@@ -194,47 +196,71 @@ export async function listJobs(pool: Pool, options: ListJobsOptions): Promise<Li
 // BullMQ deliveries and stale/duplicate workers safe (requirement: "protect
 // terminal states from stale or duplicate workers").
 
-export async function transitionToRunning(pool: Pool, jobId: string): Promise<JobRow | undefined> {
+export async function transitionToRunning(pool: Pool, jobId: string, runningToken: string): Promise<JobRow | undefined> {
   // Deliberately allows re-entering 'running' from 'running' itself (not just
   // queued/retrying): after a worker crash + stalled-job recovery, BullMQ
   // redelivers the same job to a new worker while the DB may still say
   // 'running' from the dead worker's last write. Only the two terminal
   // states block this transition.
+  //
+  // Every (re-)entry stamps a fresh running_token, unconditionally -- the
+  // most recent attempt to reach here always wins ownership. That's what
+  // lets a stale attempt's own transitionToRetrying/Succeeded/Failed call
+  // (below) recognize it's been superseded: its finalize presents the token
+  // it was handed here, and by then a newer attempt may have overwritten it.
   const { rows } = await pool.query<JobRow>(
-    `UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now()
+    `UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, now()), running_token = $2, updated_at = now()
      WHERE id = $1 AND status NOT IN ('succeeded', 'failed')
      RETURNING *`,
-    [jobId],
+    [jobId, runningToken],
   );
   return rows[0];
 }
 
-export async function transitionToRetrying(pool: Pool, jobId: string, errorMessage: string, attempts: number): Promise<JobRow | undefined> {
+export async function transitionToRetrying(
+  pool: Pool,
+  jobId: string,
+  errorMessage: string,
+  attempts: number,
+  runningToken: string,
+): Promise<JobRow | undefined> {
   const { rows } = await pool.query<JobRow>(
     `UPDATE jobs SET status = 'retrying', error = $2, attempts = $3, updated_at = now()
-     WHERE id = $1 AND status = 'running'
+     WHERE id = $1 AND status = 'running' AND running_token = $4
      RETURNING *`,
-    [jobId, errorMessage, attempts],
+    [jobId, errorMessage, attempts, runningToken],
   );
   return rows[0];
 }
 
-export async function transitionToSucceeded(pool: Pool, jobId: string, result: unknown, attempts: number): Promise<JobRow | undefined> {
+export async function transitionToSucceeded(
+  pool: Pool,
+  jobId: string,
+  result: unknown,
+  attempts: number,
+  runningToken: string,
+): Promise<JobRow | undefined> {
   const { rows } = await pool.query<JobRow>(
     `UPDATE jobs SET status = 'succeeded', result = $2, error = NULL, attempts = $3, finished_at = now(), updated_at = now()
-     WHERE id = $1 AND status NOT IN ('succeeded', 'failed')
+     WHERE id = $1 AND status NOT IN ('succeeded', 'failed') AND running_token = $4
      RETURNING *`,
-    [jobId, JSON.stringify(result), attempts],
+    [jobId, JSON.stringify(result), attempts, runningToken],
   );
   return rows[0];
 }
 
-export async function transitionToFailed(pool: Pool, jobId: string, errorMessage: string, attempts: number): Promise<JobRow | undefined> {
+export async function transitionToFailed(
+  pool: Pool,
+  jobId: string,
+  errorMessage: string,
+  attempts: number,
+  runningToken: string,
+): Promise<JobRow | undefined> {
   const { rows } = await pool.query<JobRow>(
     `UPDATE jobs SET status = 'failed', error = $2, attempts = $3, finished_at = now(), updated_at = now()
-     WHERE id = $1 AND status NOT IN ('succeeded', 'failed')
+     WHERE id = $1 AND status NOT IN ('succeeded', 'failed') AND running_token = $4
      RETURNING *`,
-    [jobId, errorMessage, attempts],
+    [jobId, errorMessage, attempts, runningToken],
   );
   return rows[0];
 }

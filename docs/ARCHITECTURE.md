@@ -226,13 +226,16 @@ fault spec read from the payload.
 `src/jobs/fingerprint.ts` computes `sha256(canonicalJSON(payload))`, where
 `canonicalize()` recursively sorts object keys (so `{a,b}` and `{b,a}` hash
 identically) before `JSON.stringify`. For an image submission, the "payload"
-fingerprinted is `{ originalFilename, fileSizeBytes, _fault? }` --
-notably **not** the raw image bytes themselves (comparing multi-megabyte
-buffers on every submission would be wasteful; the display filename + byte
-count is enough to catch "this looks like a different upload" for the
-idempotency-conflict check this project needs). This is a deliberate scope
-choice: a stricter implementation could fingerprint the file's own sha256
-instead, at the cost of hashing every upload up front.
+fingerprinted is `{ originalFilename, fileSizeBytes, contentSha256, _fault? }`
+-- `contentSha256` is a sha256 of the uploaded bytes themselves, computed once
+in `submitImageJob.ts` before the file is written to disk. Hashing the bytes
+(not just the display filename and byte count) is what makes the
+idempotency-conflict check trustworthy: two different images that happen to
+share a filename and size -- easy to construct by accident or on purpose --
+must not be treated as "the same request" just because an idempotency key was
+reused. Hashing is a single streaming pass over a buffer already held in
+memory, so the cost is negligible next to the thumbnail generation the job
+does anyway.
 
 ## What would need to change for real production use
 

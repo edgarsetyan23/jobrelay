@@ -1,6 +1,7 @@
 // The actual per-job work, independent of BullMQ's Job wrapper so it's easy
 // to reason about and unit-test the transition logic. See docs/ARCHITECTURE.md
 // "Life of a job" for the full state diagram this function implements.
+import { randomUUID } from "node:crypto";
 import type { Job } from "bullmq";
 import { UnrecoverableError } from "bullmq";
 import type { Pool } from "pg";
@@ -24,6 +25,8 @@ export interface ImageJobPayload {
   /** Display-only, sanitized client-supplied filename. Never used to build a filesystem path. */
   originalFilename: string;
   fileSizeBytes: number;
+  /** sha256 of the uploaded bytes -- part of the idempotency fingerprint, see submitImageJob.ts. */
+  contentSha256: string;
   /** Only ever honored for jobs on the demo queue -- see the header comment in src/faults/inject.ts. */
   _fault?: FaultSpec;
 }
@@ -34,9 +37,9 @@ export interface ProcessorDeps {
   workerId: string;
   storagePaths: StoragePaths;
   imageLimits: ImageLimits;
-  /** Called right before/after processing so the worker can heartbeat its busy/idle status. */
+  /** Called right before/after processing so the worker can heartbeat its busy/idle status against the set of jobs it actually has in flight. */
   onJobStart?: (jobId: string) => void;
-  onJobEnd?: () => void;
+  onJobEnd?: (jobId: string) => void;
 }
 
 export function makeProcessor(deps: ProcessorDeps) {
@@ -64,7 +67,15 @@ export function makeProcessor(deps: ProcessorDeps) {
         return record.result;
       }
 
-      const running = await transitionToRunning(deps.pool, jobId);
+      // A fencing token unique to *this* attempt (not BullMQ's attemptsMade,
+      // which can repeat: a lock-expiry redelivery to a new worker reuses
+      // the same attempt number the still-alive old worker is holding).
+      // transitionToRunning stamps it fresh; every finalize below must
+      // present it back, so whichever attempt most recently claimed
+      // 'running' is the only one allowed to decide the outcome -- see
+      // docs/FAILURE_SCENARIOS.md "Worker crash" and 003_attempt_ownership.sql.
+      const runningToken = randomUUID();
+      const running = await transitionToRunning(deps.pool, jobId, runningToken);
       if (!running) {
         const latest = await getJobById(deps.pool, jobId);
         if (latest && (latest.status === "succeeded" || latest.status === "failed")) {
@@ -107,9 +118,20 @@ export function makeProcessor(deps: ProcessorDeps) {
           })),
         };
 
-        await transitionToSucceeded(deps.pool, jobId, result, attemptNumber);
+        const succeeded = await transitionToSucceeded(deps.pool, jobId, result, attemptNumber, runningToken);
         const durationMs = Date.now() - startedAt;
+        // This attempt's own history entry reflects what actually happened
+        // to it, independent of whether it won the job-level race below.
         await recordAttemptEnd(deps.pool, attemptRowId, "succeeded", null);
+        if (!succeeded) {
+          // Lost the fencing-token race: a newer attempt (our own
+          // replacement, spun up after BullMQ decided our lock had expired)
+          // already claimed 'running' again and will finalize the job
+          // itself. Don't overwrite whatever it eventually writes.
+          const latest = await getJobById(deps.pool, jobId);
+          deps.logger.warn({ jobId, attempt: attemptNumber }, "completed work but lost attempt-ownership race; discarding this attempt's job-level result");
+          return latest?.result ?? result;
+        }
         metrics.recordCompleted();
         metrics.recordProcessingMs(durationMs);
         deps.logger.info({ jobId, attempt: attemptNumber, transition: "running -> succeeded", durationMs }, "job succeeded");
@@ -119,25 +141,37 @@ export function makeProcessor(deps: ProcessorDeps) {
         const message = err instanceof Error ? err.message : String(err);
 
         if (err instanceof ValidationError) {
-          await transitionToFailed(deps.pool, jobId, message, attemptNumber);
+          const failed = await transitionToFailed(deps.pool, jobId, message, attemptNumber, runningToken);
           await recordAttemptEnd(deps.pool, attemptRowId, "failed", message);
-          metrics.recordFailed();
-          deps.logger.warn({ jobId, attempt: attemptNumber, transition: "running -> failed", durationMs, reason: "validation" }, "job failed permanently: invalid input");
+          if (!failed) {
+            deps.logger.warn({ jobId, attempt: attemptNumber }, "validation failed but lost attempt-ownership race; a newer attempt now owns this job");
+          } else {
+            metrics.recordFailed();
+            deps.logger.warn({ jobId, attempt: attemptNumber, transition: "running -> failed", durationMs, reason: "validation" }, "job failed permanently: invalid input");
+          }
           // Overrides BullMQ's attempts/backoff entirely -- no retry, ever.
           throw new UnrecoverableError(message);
         }
 
         const isLastAttempt = attemptNumber >= record.max_attempts;
         if (isLastAttempt) {
-          await transitionToFailed(deps.pool, jobId, `retries exhausted: ${message}`, attemptNumber);
+          const failed = await transitionToFailed(deps.pool, jobId, `retries exhausted: ${message}`, attemptNumber, runningToken);
           await recordAttemptEnd(deps.pool, attemptRowId, "failed", message);
-          metrics.recordFailed();
-          deps.logger.warn({ jobId, attempt: attemptNumber, transition: "running -> failed", durationMs, reason: "retries_exhausted" }, "job failed: retries exhausted");
+          if (!failed) {
+            deps.logger.warn({ jobId, attempt: attemptNumber }, "retries exhausted but lost attempt-ownership race; a newer attempt now owns this job");
+          } else {
+            metrics.recordFailed();
+            deps.logger.warn({ jobId, attempt: attemptNumber, transition: "running -> failed", durationMs, reason: "retries_exhausted" }, "job failed: retries exhausted");
+          }
         } else {
-          await transitionToRetrying(deps.pool, jobId, message, attemptNumber);
+          const retrying = await transitionToRetrying(deps.pool, jobId, message, attemptNumber, runningToken);
           await recordAttemptEnd(deps.pool, attemptRowId, "retrying", message);
-          metrics.recordRetried();
-          deps.logger.warn({ jobId, attempt: attemptNumber, transition: "running -> retrying", durationMs }, "job attempt failed transiently, will retry");
+          if (!retrying) {
+            deps.logger.warn({ jobId, attempt: attemptNumber }, "transient failure but lost attempt-ownership race; a newer attempt now owns this job");
+          } else {
+            metrics.recordRetried();
+            deps.logger.warn({ jobId, attempt: attemptNumber, transition: "running -> retrying", durationMs }, "job attempt failed transiently, will retry");
+          }
         }
         // Re-throw a plain error (not UnrecoverableError) so BullMQ applies
         // its normal attempts/backoff bookkeeping and either schedules the
@@ -145,7 +179,7 @@ export function makeProcessor(deps: ProcessorDeps) {
         throw err;
       }
     } finally {
-      deps.onJobEnd?.();
+      deps.onJobEnd?.(jobId);
     }
   };
 }

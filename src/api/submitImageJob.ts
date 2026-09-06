@@ -4,7 +4,7 @@
 // everything else (idempotency, the outbox write, orphaned-file cleanup) is
 // identical, which is exactly why it lives in one place instead of being
 // copy-pasted with a chance to drift.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { rm, writeFile } from "node:fs/promises";
 import type { Pool } from "pg";
 import { createJobWithOutbox, IdempotencyConflictError, type CreateJobOutcome } from "../db/jobsRepo.js";
@@ -48,6 +48,12 @@ export async function submitImageJob(deps: SubmitImageJobDeps, input: SubmitImag
   const payload: ImageJobPayload = {
     originalFilename: sanitizeFilenameForDisplay(input.file.originalname),
     fileSizeBytes: input.file.buffer.length,
+    // Hashing the actual bytes (not just filename + size) is what makes the
+    // idempotency fingerprint below trustworthy: two different images that
+    // happen to share a filename and byte count -- easy to construct by
+    // accident or on purpose -- must not be treated as "the same request"
+    // just because an idempotency key was reused.
+    contentSha256: createHash("sha256").update(input.file.buffer).digest("hex"),
     ...(input.isDemo && input.fault ? { _fault: input.fault } : {}),
   };
 

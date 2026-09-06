@@ -115,7 +115,12 @@ Readiness -- checks Postgres and Redis with a short timeout each.
     "currentJobId": "…", "startedAt": "…", "lastHeartbeatAt": "…" } ] }
 ```
 `status` is `idle`, `busy`, or `offline` (inferred from a stale heartbeat,
-never self-reported -- see docs/FAILURE_SCENARIOS.md).
+never self-reported -- see docs/FAILURE_SCENARIOS.md), and is `busy` whenever
+the worker has *any* job in flight -- with `WORKER_CONCURRENCY > 1` that can
+be more than one at a time. `currentJobId` is only one representative job id
+out of a possibly larger active set, useful for a quick look but not a
+complete picture of concurrency > 1; it is not what `status` is derived
+from.
 
 ## `GET /api/config`
 

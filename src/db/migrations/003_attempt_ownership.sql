@@ -1,0 +1,16 @@
+-- A guarded UPDATE ... WHERE status NOT IN ('succeeded','failed') stops a
+-- stale write from clobbering a *terminal* job, but it does nothing to
+-- arbitrate between two attempts that are simultaneously non-terminal --
+-- e.g. a worker whose lock expired (so BullMQ redelivered the job to a new
+-- worker) but which is still actually running and hasn't noticed yet. Both
+-- the old and the new attempt see status IN ('running') and are equally
+-- entitled to finalize the job under the old guard alone.
+--
+-- running_token is a fencing token: transitionToRunning() stamps a fresh
+-- random value every time a job (re-)enters 'running', and every subsequent
+-- finalizing transition (retrying/succeeded/failed) must present the token
+-- it was handed when it *started* -- if a newer attempt has since claimed
+-- running and overwritten the token, the older attempt's finalize is a
+-- guarded no-op instead of a race. See src/worker/processor.ts and
+-- docs/FAILURE_SCENARIOS.md "Worker crash".
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS running_token TEXT;

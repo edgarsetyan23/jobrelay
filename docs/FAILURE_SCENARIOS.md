@@ -13,6 +13,7 @@ demo" columns say exactly that -- nothing here is aspirational.
 | Transient failure, then success | yes | `retries.test.ts`, `demoPanel.test.ts` | "Fail this attempt" |
 | Retry exhaustion | yes | `retries.test.ts` | -- |
 | Worker crash mid-job, recovery | yes | `crashRecovery.test.ts`, `demoPanel.test.ts` (real process) | "Stop this worker" |
+| Stale (lock-expired but still alive) attempt can't finalize over its replacement | yes | `attemptOwnership.test.ts` | -- |
 | Redis unavailable after Postgres accept, then recovery | yes | `redisOutage.test.ts` | -- |
 | Duplicate delivery -> one authoritative result | yes | `duplicateDelivery.test.ts` | -- |
 | Graceful shutdown (API and worker) | yes | manual (see below) | -- |
@@ -129,6 +130,21 @@ Another worker eventually picks the same job up and finishes it.
   transitioning `running -> running` (not just `queued/retrying ->
   running`), because the recovering attempt finds the row already marked
   `running` from the dead worker's last write.
+- That reentrant transition also stamps a fresh random `running_token` on
+  the job row. This matters because "the old worker crashed" isn't actually
+  guaranteed by a stalled lock -- a worker whose lock merely expired (a long
+  GC pause, a saturated event loop) but which is still very much alive and
+  still processing is exactly what the stalled-job mechanism can't tell
+  apart from a true crash. Without an ownership check, that still-running
+  old attempt and its BullMQ-redelivered replacement would both be free to
+  finalize the same job -- whichever calls `transitionToSucceeded` /
+  `transitionToRetrying` / `transitionToFailed` first wins, regardless of
+  which one is actually "supposed to." Each finalize call must present the
+  `running_token` it was handed when *it* entered `running`; if a newer
+  attempt has since re-claimed the job (overwriting the token), the older
+  attempt's finalize call is a guarded no-op instead of a race -- see
+  `src/db/migrations/003_attempt_ownership.sql` and the fencing-token
+  comment in `src/worker/processor.ts`.
 
 **Graceful vs. crash, and what changes:** `worker.close()` (called on
 `SIGINT`/`SIGTERM` in `worker.ts`) stops accepting new jobs and waits for

@@ -60,16 +60,39 @@ the short version is that BullMQ's `jobId`-based dedup makes a second
 ### `makeProcessor` -> `processJob` (`src/worker/processor.ts`)
 
 The heart of the system. In order: fetch the job; if it's already terminal,
-return the stored result and stop (duplicate-delivery guard); otherwise
-guard-transition to `running`; record an attempt; run the fault-injection
-hook (only ever live for demo jobs); validate + generate thumbnails; on
-success, guard-transition to `succeeded`; on `ValidationError`, guard-
-transition to `failed` and throw `UnrecoverableError` (no retry); on any
-other error, guard-transition to `retrying` or `failed` (if attempts are
-exhausted) and re-throw a plain error so BullMQ's own retry/backoff
-bookkeeping applies. Every transition function it calls is one of the
-guarded `UPDATE ... WHERE status NOT IN (...)` functions in `jobsRepo.ts` --
-that's what makes this function safe to call twice for the same job.
+return the stored result and stop (duplicate-delivery guard); otherwise mint
+a fresh `runningToken` (`randomUUID()`) and guard-transition to `running`
+with it; record an attempt; run the fault-injection hook (only ever live for
+demo jobs); validate + generate thumbnails; on success, guard-transition to
+`succeeded`; on `ValidationError`, guard-transition to `failed` and throw
+`UnrecoverableError` (no retry); on any other error, guard-transition to
+`retrying` or `failed` (if attempts are exhausted) and re-throw a plain error
+so BullMQ's own retry/backoff bookkeeping applies. Every transition function
+it calls is one of the guarded `UPDATE ... WHERE status NOT IN (...)`
+functions in `jobsRepo.ts` -- that's what makes this function safe to call
+twice for the same job.
+
+The finalizing transitions (`transitionToSucceeded`/`Retrying`/`Failed`) also
+require `runningToken` to match the job's *current* `running_token` in
+Postgres. That's a second, independent guard from the status check: status
+alone stops a stale write from clobbering a *terminal* job, but it can't
+arbitrate between two attempts that are simultaneously non-terminal -- e.g. a
+worker whose lock merely expired (so BullMQ redelivered the job) but which is
+still alive and still processing. Both attempts see `status = 'running'` and
+would be equally entitled to finalize under a status-only guard. Because
+`transitionToRunning` stamps a fresh token every time a job (re-)enters
+`running`, the older attempt's eventual finalize call presents a token that's
+already been overwritten, and its write is a no-op instead of a race -- see
+`test/integration/attemptOwnership.test.ts` and
+`src/db/migrations/003_attempt_ownership.sql`. When a finalize call loses
+this race, `processJob` logs a warning and discards its own write; it does
+not retry or error out on account of the loss, since a different attempt
+already owns the job's outcome. Note this also means BullMQ's own
+`attemptsMade` (and the job's `attempts` column) can repeat across attempts
+in a stall-recovery scenario -- it isn't incremented just because a stalled
+job was redelivered, only when an attempt actually threw -- which is exactly
+why `runningToken` is a fresh random value per attempt rather than derived
+from `attemptsMade`.
 
 ### `makeBackoffStrategy` (`src/queue/backoff.ts`)
 
@@ -107,19 +130,27 @@ Try answering these from memory, then check your answer against the code.
    *longer* than a typical job's processing time?
 5. Why does `transitionToRunning` allow `running -> running`, when every
    other transition only allows leaving a specific starting state?
-6. The benchmark shows completed-jobs/sec roughly doubling from concurrency 1
+6. `transitionToRunning` also stamps a fresh `running_token` every time,
+   unconditionally. `job.attemptsMade` (BullMQ's own attempt counter) can't
+   be used for this instead -- why not? What specific scenario does
+   `running_token` guard against that the `status`-only guard alone doesn't?
+7. The benchmark shows completed-jobs/sec roughly doubling from concurrency 1
    to 2, then leveling off well before concurrency 8. What are three
    plausible reasons throughput would plateau like that?
-7. Why is the payload fingerprint computed over `{originalFilename,
-   fileSizeBytes}` rather than the image bytes themselves? What's the
-   tradeoff?
-8. What specifically stops a normal (non-demo) upload from ever being
+8. The payload fingerprint includes `contentSha256`, a hash of the image
+   bytes, alongside `originalFilename` and `fileSizeBytes`. Why isn't the
+   filename/size pair enough on its own?
+9. What specifically stops a normal (non-demo) upload from ever being
    affected by the `_fault` mechanism, at the code level (not just "it's not
    exposed in the UI")?
-9. If Redis's data were completely lost right now, what could be recovered
-   from Postgres alone, and what's missing to actually do that automatically?
-10. Why are there two separate BullMQ queues instead of one queue with an
+10. If Redis's data were completely lost right now, what could be recovered
+    from Postgres alone, and what's missing to actually do that automatically?
+11. Why are there two separate BullMQ queues instead of one queue with an
     `is_demo` flag inspected by a single shared worker pool?
+12. `src/worker/worker.ts` tracks its in-flight jobs in a `Set<string>`
+    rather than a single `currentJobId` variable. Construct a concrete
+    sequence of events with `WORKER_CONCURRENCY=2` where the single-variable
+    version reports `idle` while a job is still actually running.
 
 ## Exercises
 

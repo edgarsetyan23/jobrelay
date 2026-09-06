@@ -22,9 +22,21 @@ async function main(): Promise<void> {
   const workerId = config.WORKER_ID_OVERRIDE ?? `${kind}-${hostname()}-${process.pid}-${randomUUID().slice(0, 6)}`;
   const queueName = kind === "demo" ? config.DEMO_QUEUE_NAME : config.MAIN_QUEUE_NAME;
 
-  let currentJobId: string | null = null;
+  // The set of jobs this worker currently has in flight -- not just the last
+  // one started or finished. With WORKER_CONCURRENCY > 1, a single
+  // "currentJobId" variable set on start and cleared on end would report
+  // 'idle' the moment *any* job finishes even while others are still
+  // running (whichever onJobEnd fires last always wins the clear). Deriving
+  // busy/idle from the set's size instead keeps the heartbeat honest at any
+  // concurrency.
+  const activeJobIds = new Set<string>();
 
-  async function heartbeat(status: "idle" | "busy"): Promise<void> {
+  async function heartbeat(): Promise<void> {
+    const status: "idle" | "busy" = activeJobIds.size > 0 ? "busy" : "idle";
+    // Only one job id fits the `workers.current_job_id` column; it's a
+    // display convenience (see /api/workers), not the source of truth for
+    // busy/idle -- that's `status`, above, derived from the whole set.
+    const currentJobId = activeJobIds.size > 0 ? [...activeJobIds][0]! : null;
     await upsertWorkerHeartbeat(pool, { id: workerId, kind, pid: process.pid, status, currentJobId }).catch((err) => {
       logger.warn({ err, workerId }, "worker heartbeat failed (will retry on next tick)");
     });
@@ -41,12 +53,12 @@ async function main(): Promise<void> {
       maxPixels: config.MAX_IMAGE_PIXELS,
     },
     onJobStart: (jobId) => {
-      currentJobId = jobId;
-      void heartbeat("busy");
+      activeJobIds.add(jobId);
+      void heartbeat();
     },
-    onJobEnd: () => {
-      currentJobId = null;
-      void heartbeat("idle");
+    onJobEnd: (jobId) => {
+      activeJobIds.delete(jobId);
+      void heartbeat();
     },
   });
 
@@ -77,8 +89,8 @@ async function main(): Promise<void> {
     logger.warn({ bullJobId: jobId }, "bullmq reports job stalled -- will be recovered by another attempt");
   });
 
-  await heartbeat("idle");
-  const heartbeatTimer = setInterval(() => void heartbeat(currentJobId ? "busy" : "idle"), config.WORKER_HEARTBEAT_INTERVAL_MS);
+  await heartbeat();
+  const heartbeatTimer = setInterval(() => void heartbeat(), config.WORKER_HEARTBEAT_INTERVAL_MS);
   heartbeatTimer.unref();
 
   logger.info({ workerId, kind, queue: queueName, concurrency: config.WORKER_CONCURRENCY }, "jobrelay worker started");

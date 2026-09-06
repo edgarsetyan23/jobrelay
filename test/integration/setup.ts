@@ -106,9 +106,15 @@ export async function createTestHarness(configOverrides: Partial<Config> = {}): 
     const queueName = kind === "demo" ? workerConfig.DEMO_QUEUE_NAME : workerConfig.MAIN_QUEUE_NAME;
     const connection = new Redis(workerConfig.REDIS_URL, { maxRetriesPerRequest: null });
 
-    let currentJobId: string | null = null;
-    const heartbeat = (status: "idle" | "busy") =>
-      upsertWorkerHeartbeat(pool, { id: workerId, kind, pid: process.pid, status, currentJobId }).catch(() => {});
+    // Mirrors src/worker/worker.ts: a set, not a single scalar, so a test
+    // harness worker started with concurrency > 1 reports 'busy' accurately
+    // while more than one job is in flight.
+    const activeJobIds = new Set<string>();
+    const heartbeat = () => {
+      const status: "idle" | "busy" = activeJobIds.size > 0 ? "busy" : "idle";
+      const currentJobId = activeJobIds.size > 0 ? [...activeJobIds][0]! : null;
+      return upsertWorkerHeartbeat(pool, { id: workerId, kind, pid: process.pid, status, currentJobId }).catch(() => {});
+    };
 
     const processor = makeProcessor({
       pool,
@@ -117,12 +123,12 @@ export async function createTestHarness(configOverrides: Partial<Config> = {}): 
       storagePaths,
       imageLimits: { maxUploadBytes: workerConfig.MAX_UPLOAD_BYTES, maxDimensionPx: workerConfig.MAX_IMAGE_DIMENSION_PX, maxPixels: workerConfig.MAX_IMAGE_PIXELS },
       onJobStart: (jobId) => {
-        currentJobId = jobId;
-        void heartbeat("busy");
+        activeJobIds.add(jobId);
+        void heartbeat();
       },
-      onJobEnd: () => {
-        currentJobId = null;
-        void heartbeat("idle");
+      onJobEnd: (jobId) => {
+        activeJobIds.delete(jobId);
+        void heartbeat();
       },
     });
     const worker = new Worker<JobQueueData>(queueName, processor, {
@@ -139,7 +145,7 @@ export async function createTestHarness(configOverrides: Partial<Config> = {}): 
     // deliberately sever connections mid-flight.
     worker.on("error", () => {});
     connection.on("error", () => {});
-    void heartbeat("idle");
+    void heartbeat();
     workers.push({ worker, connection, workerId });
     return { worker, workerId, connection };
   }
