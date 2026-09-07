@@ -118,6 +118,13 @@ processes (unless `DEMO_ENABLED=false`); `npm run dev:worker` is the one
 process you start yourself, matching "one API process, one independently
 runnable worker process."
 
+`npm run test:integration` uses its own `jobrelay_test` database on the same
+Postgres server (auto-created on first run) -- not the `jobrelay` database
+your dev API/worker use -- so running the suite never adds test tickets to
+the dispatch board you're looking at in the browser. Override with
+`TEST_DATABASE_URL`/`TEST_REDIS_URL` if you need the suite to point
+somewhere else; see `test/integration/setup.ts`.
+
 ## Test results (this session)
 
 ```

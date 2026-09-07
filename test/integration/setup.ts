@@ -21,11 +21,54 @@ import { resolveStoragePaths, ensureStorageDirs, type StoragePaths } from "../..
 import { logger } from "../../src/logger.js";
 import type { Config } from "../../src/config.js";
 
-const TEST_DATABASE_URL = process.env.DATABASE_URL ?? "postgres://jobrelay:jobrelay@localhost:5432/jobrelay";
-const TEST_REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6379";
+// Deliberately NOT `process.env.DATABASE_URL` / `REDIS_URL`: importing
+// runMigrations (below) transitively imports src/config.ts, which runs
+// `import "dotenv/config"` as a side effect -- so by the time this line
+// runs, DATABASE_URL/REDIS_URL are already populated from .env, the exact
+// same file the dev API/worker read. Reusing them here would mean every
+// integration test run writes into the *same* Postgres database a
+// developer is looking at in the browser -- which is exactly what used to
+// happen: jobs from `npm run test:integration` piling up on the live
+// dispatch board next to real manual-testing tickets. Dedicated env var
+// names, defaulting to a same-server-different-database URL, keep the two
+// completely separate regardless of what .env says.
+const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? "postgres://jobrelay:jobrelay@localhost:5432/jobrelay_test";
+const TEST_REDIS_URL = process.env.TEST_REDIS_URL ?? "redis://localhost:6379";
 
 // pino is noisy for a test run; silence it unless LOG_LEVEL is set explicitly.
 if (!process.env.LOG_LEVEL) logger.level = "silent";
+
+/**
+ * Creates the test database on first use if it doesn't exist yet -- no
+ * docker-compose or manual setup step required. Postgres has no
+ * `CREATE DATABASE IF NOT EXISTS`, so this just attempts the create and
+ * swallows the "already exists" error (SQLSTATE 42P04); any other failure
+ * (e.g. Postgres genuinely unreachable) still surfaces normally, since
+ * runMigrations against a bad connection would fail immediately after
+ * anyway. Memoized so N test files calling createTestHarness() in the same
+ * process only ever attempt this once.
+ */
+let testDatabaseReady: Promise<void> | undefined;
+function ensureTestDatabaseExists(): Promise<void> {
+  if (!testDatabaseReady) {
+    testDatabaseReady = (async () => {
+      const target = new URL(TEST_DATABASE_URL);
+      const dbName = target.pathname.replace(/^\//, "");
+      const adminUrl = new URL(TEST_DATABASE_URL);
+      adminUrl.pathname = "/postgres"; // every Postgres server has this database; used only to issue CREATE DATABASE
+      const adminPool = new Pool({ connectionString: adminUrl.toString(), max: 1 });
+      adminPool.on("error", () => {});
+      try {
+        await adminPool.query(`CREATE DATABASE "${dbName}"`);
+      } catch (err) {
+        if ((err as { code?: string }).code !== "42P04") throw err; // 42P04 = duplicate_database
+      } finally {
+        await adminPool.end();
+      }
+    })();
+  }
+  return testDatabaseReady;
+}
 
 export const testConfig: Config = {
   NODE_ENV: "test",
@@ -91,6 +134,7 @@ export async function createTestHarness(configOverrides: Partial<Config> = {}): 
     STORAGE_DIR: storageDir,
     ...configOverrides,
   };
+  await ensureTestDatabaseExists();
   const pool = new Pool({ connectionString: config.DATABASE_URL, max: 5 });
   pool.on("error", () => {});
   await runMigrations(pool);
