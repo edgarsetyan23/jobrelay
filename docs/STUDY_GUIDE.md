@@ -114,6 +114,51 @@ overwrite, because nothing the winner wrote ever moves. See
 `test/integration/successCommitCrash.test.ts`, and the "Attempt isolation"
 part of docs/ARCHITECTURE.md's Storage section.
 
+**Three phases, three different failure-handling rules.** `processJob`'s
+body is explicitly split into three parts, each with its own try/catch,
+because they need different answers to "what does a failure here mean":
+
+1. **Do the work** (fault injection through thumbnail generation). A
+   failure here is a genuine processing failure -- no success has been
+   attempted yet, so this attempt's output directory is never a published
+   result. Always safe to `discardAttemptResult` and run the normal
+   fail/retry logic.
+2. **Commit success** (`transitionToSucceeded`). A failure here needs its
+   own three-way answer, because the attempt's files might already be the
+   published result even though this call failed:
+   - The UPDATE returns `undefined` (an ordinary 0-row update, no
+     exception): a fresh fencing-token loss, handled the same as before --
+     discard and return the actual winner's result.
+   - The UPDATE **throws**, but re-querying Postgres shows this attempt's
+     token *did* get written (`result_attempt_token === runningToken`,
+     `status === 'succeeded'`): it committed and only the acknowledgment
+     was lost. Treated exactly like a normal win.
+   - The UPDATE throws and re-querying shows a *different* attempt already
+     owns a terminal outcome: confirmed loss, safe to discard.
+   - The UPDATE throws and re-querying shows the row is **still
+     non-terminal**: genuinely unknown whether it committed. The rule is
+     "never guess toward deletion" -- `discardAttemptResult` is *not*
+     called, and the error is re-thrown for BullMQ's ordinary retry
+     bookkeeping. A false "leave an orphaned directory the retention sweep
+     eventually cleans up" costs disk space for a while; a false "delete
+     the real published result" is data loss neither is recoverable from.
+3. **Best-effort bookkeeping** (`recordAttemptEnd`, metrics, the success log
+   line) -- only ever reached once phase 2 has *confirmed* this attempt
+   won. Its own try/catch never rethrows: a history-write or metrics
+   failure here is logged as a warning and nothing else. The job already
+   succeeded and its files are already published; nothing in this phase is
+   allowed to undo either fact.
+
+Before this split existed, phases 2 and 3 shared one catch block with phase
+1 -- so a `recordAttemptEnd` failure landing *after* a real success would
+run the exact same cleanup as a genuine processing failure: delete the
+just-published files and re-throw, making BullMQ retry work that had
+already durably completed. See
+`test/integration/postSuccessFailureIsolation.test.ts` for both of these
+(a history-write failure after success, and an uncertain
+`transitionToSucceeded` outcome) reproduced against a real injected
+Postgres trigger, not a mock.
+
 ### `makeBackoffStrategy` (`src/queue/backoff.ts`)
 
 A closure over the configured base/max/jitter that BullMQ calls with

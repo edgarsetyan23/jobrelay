@@ -17,6 +17,8 @@ demo" columns say exactly that -- nothing here is aspirational.
 | Stale attempt's file writes can't corrupt the winner's published downloads | yes | `attemptIsolation.test.ts` | -- |
 | Crash immediately before the success update | yes | `successCommitCrash.test.ts` | -- |
 | Crash immediately after the success update | yes | `successCommitCrash.test.ts` | -- |
+| History-write failure after success doesn't delete files or retry | yes | `postSuccessFailureIsolation.test.ts` | -- |
+| Uncertain success-update outcome preserves files, doesn't assume rollback | yes | `postSuccessFailureIsolation.test.ts` | -- |
 | Redis unavailable after Postgres accept, then recovery | yes | `redisOutage.test.ts` | -- |
 | Duplicate delivery -> one authoritative result | yes | `duplicateDelivery.test.ts` | -- |
 | Graceful shutdown (API and worker) | yes | manual (see below) | -- |
@@ -204,6 +206,36 @@ immediately before and immediately after the success database write:
   stalled-job redelivery of the *same* BullMQ job hits the duplicate-delivery
   guard at the very top of `processJob` and returns the stored result
   untouched -- no new `job_attempts` row, no re-generated files.
+
+**A bookkeeping failure is not a processing failure:** `successCommitCrash.test.ts`
+covers the process disappearing outright; `postSuccessFailureIsolation.test.ts`
+covers the narrower but easier-to-actually-hit case where the *process*
+keeps running fine but one specific database write fails. `processJob`'s
+success path is split into three phases specifically so these two tests
+have something real to hold it to (see the "Three phases" writeup in
+`docs/STUDY_GUIDE.md`'s `makeProcessor` section for the full breakdown):
+
+- **History-write failure after success**: a real Postgres trigger (created
+  and dropped by the test itself, not a mock) blocks every UPDATE to
+  `job_attempts` for one specific worker. `transitionToSucceeded` (a write
+  to `jobs`, a different table) is untouched, so the job genuinely
+  succeeds; only `recordAttemptEnd`'s own history-row update fails. Before
+  the phase split, that failure landed in the same catch block as a real
+  processing error and would have deleted the just-published files and
+  made BullMQ retry already-completed work. The test asserts the opposite:
+  the job stays `succeeded`, its files stay downloadable, and no retry
+  happens -- the failure surfaces only as a warning log line and a
+  `job_attempts` row stuck at `'running'` (an honest record of "this
+  attempt's own bookkeeping never finished," not a correctness problem).
+- **Uncertain success-update outcome**: a trigger blocks the *jobs* table's
+  transition to `'succeeded'` for one specific job, so
+  `transitionToSucceeded` itself throws. `processJob` must not assume that
+  throw means "definitely didn't commit" -- it re-queries Postgres, finds
+  the row still non-terminal (genuinely unresolved), and the rule is "never
+  guess toward deletion": the attempt's files are left in place and the
+  error is re-thrown for BullMQ's ordinary retry. The test asserts the
+  files survive that window, then removes the trigger and confirms a later
+  attempt completes normally with working downloads.
 
 **Graceful vs. crash, and what changes:** `worker.close()` (called on
 `SIGINT`/`SIGTERM` in `worker.ts`) stops accepting new jobs and waits for

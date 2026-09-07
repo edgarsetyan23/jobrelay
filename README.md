@@ -129,7 +129,7 @@ somewhere else; see `test/integration/setup.ts`.
 
 ```
 npm run test:unit        -> 13 passed  (2 files)
-npm run test:integration -> 27 passed  (10 files, real Postgres + Redis;
+npm run test:integration -> 29 passed  (11 files, real Postgres + Redis;
                                          one test spawns and kills a real
                                          OS worker process)
 ```
@@ -187,6 +187,12 @@ are documented there.
   slower and marginally more environment-sensitive than the rest of the
   suite (it boots an actual Node process). It passed repeatedly in this
   session; flag it first if the integration suite is ever flaky.
+- `test/integration/redisOutage.test.ts` stops and restarts the actual
+  Redis Docker container mid-test; it has been observed to time out once
+  when run as part of the full suite back-to-back with everything else
+  (passed cleanly alone, and on every other run) -- most likely Docker
+  container-restart timing under load rather than an application bug. If
+  it ever fails, re-run it in isolation before assuming a regression.
 
 ## Security
 

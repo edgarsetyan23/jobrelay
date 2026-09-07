@@ -13,6 +13,7 @@ import {
   transitionToRetrying,
   transitionToRunning,
   transitionToSucceeded,
+  type JobRow,
 } from "../db/jobsRepo.js";
 import { generateThumbnails, ValidationError, type ImageLimits } from "../jobs/thumbnails.js";
 import { applyFault, type FaultSpec } from "../faults/inject.js";
@@ -29,6 +30,15 @@ export interface ImageJobPayload {
   contentSha256: string;
   /** Only ever honored for jobs on the demo queue -- see the header comment in src/faults/inject.ts. */
   _fault?: FaultSpec;
+}
+
+interface ImageJobResult {
+  originalFilename: string;
+  format: string;
+  width: number;
+  height: number;
+  fileSizeBytes: number;
+  thumbnails: Array<{ label: string; width: number; height: number; fileSizeBytes: number; url: string }>;
 }
 
 export interface ProcessorDeps {
@@ -111,6 +121,14 @@ export function makeProcessor(deps: ProcessorDeps) {
 
       const payload = record.payload as ImageJobPayload;
 
+      // ---- Phase 1: do the actual work -------------------------------
+      // A failure anywhere in here is a genuine processing failure: no
+      // success has been attempted yet, so this attempt's output directory
+      // (typically empty -- both the fault hook and validateImageBuffer
+      // throw before any thumbnail file is written, but a failure partway
+      // through the resize loop could leave a partial one behind) is never
+      // a published result. Always safe to discard.
+      let result: ImageJobResult;
       try {
         // Fault injection is only ever meaningful for demo-queue jobs --
         // record.is_demo comes from Postgres, not from the payload, so a
@@ -139,7 +157,7 @@ export function makeProcessor(deps: ProcessorDeps) {
           deps.imageLimits,
         );
 
-        const result = {
+        result = {
           originalFilename: payload.originalFilename,
           format: metadata.format,
           width: metadata.width,
@@ -153,54 +171,9 @@ export function makeProcessor(deps: ProcessorDeps) {
             url: `/files/results/${jobId}/${t.label}.jpg`,
           })),
         };
-
-        // Every file is fully written and its handle closed by the time
-        // generateThumbnails above resolves (sharp's .toFile() only
-        // resolves once its write stream has finished and closed) -- so by
-        // this point there is nothing left to flush. Success is only ever
-        // committed after that is true; this ordering is exactly what lets
-        // the success DB row and the winning files be treated as a single
-        // durable fact once transitionToSucceeded below returns a row.
-        await deps.beforeSuccessCommit?.();
-
-        // The database decides the winner first, and permanently: this
-        // attempt's directory is never moved anywhere afterward. If this
-        // write succeeds, `result_attempt_token` (set by transitionToSucceeded
-        // itself, in the same statement) becomes the durable pointer to
-        // this exact directory -- that's what the download endpoint reads.
-        const succeeded = await transitionToSucceeded(deps.pool, jobId, result, attemptNumber, runningToken);
-        await deps.afterSuccessCommit?.();
-        const durationMs = Date.now() - startedAt;
-        // This attempt's own history entry reflects what actually happened
-        // to it, independent of whether it won the job-level race below.
-        await recordAttemptEnd(deps.pool, attemptRowId, "succeeded", null);
-        if (!succeeded) {
-          // Lost the fencing-token race: a newer attempt (our own
-          // replacement, spun up after BullMQ decided our lock had expired)
-          // already claimed 'running' again and will finalize the job
-          // itself. Don't overwrite whatever it eventually writes -- and
-          // clean up the thumbnails we generated, since nothing will ever
-          // point at this directory now.
-          await discardAttemptResult(deps.storagePaths, jobId, runningToken);
-          const latest = await getJobById(deps.pool, jobId);
-          deps.logger.warn({ jobId, attempt: attemptNumber }, "completed work but lost attempt-ownership race; discarding this attempt's files and job-level result");
-          return latest?.result ?? result;
-        }
-        // Nothing to move: this attempt's directory *is* the published
-        // result now, permanently, until retention purges the whole job.
-        metrics.recordCompleted();
-        metrics.recordProcessingMs(durationMs);
-        deps.logger.info({ jobId, attempt: attemptNumber, transition: "running -> succeeded", durationMs }, "job succeeded");
-        return result;
       } catch (err) {
         const durationMs = Date.now() - startedAt;
         const message = err instanceof Error ? err.message : String(err);
-        // No failure path ever publishes a result, so this attempt's output
-        // directory (typically empty -- both the fault hook and
-        // validateImageBuffer throw before any thumbnail file is written,
-        // but a failure partway through the resize loop could leave a
-        // partial one behind) never should either. Safe even if nothing was
-        // ever written.
         await discardAttemptResult(deps.storagePaths, jobId, runningToken);
 
         if (err instanceof ValidationError) {
@@ -241,6 +214,112 @@ export function makeProcessor(deps: ProcessorDeps) {
         // next retry or moves the job to its own failed set once exhausted.
         throw err;
       }
+
+      // ---- Phase 2: commit success ------------------------------------
+      // From here on, this attempt's files are either genuinely published
+      // or in a state only a future attempt -- never a deletion here --
+      // should resolve. A failure in this phase is NEVER treated as "this
+      // job's processing failed": the real work already happened.
+      //
+      // Every file is fully written and its handle closed by the time
+      // generateThumbnails above resolved (sharp's .toFile() only resolves
+      // once its write stream has finished and closed), so there is
+      // nothing left to flush here.
+      await deps.beforeSuccessCommit?.();
+
+      let succeededRow: JobRow | undefined;
+      try {
+        // The database decides the winner, and permanently: this attempt's
+        // directory is never moved anywhere afterward. If this write
+        // succeeds, `result_attempt_token` (set by transitionToSucceeded
+        // itself, in the same statement) becomes the durable pointer to
+        // this exact directory -- that's what the download endpoint reads.
+        succeededRow = await transitionToSucceeded(deps.pool, jobId, result, attemptNumber, runningToken);
+      } catch (commitErr) {
+        // The UPDATE call itself didn't complete cleanly -- e.g. a
+        // connection reset while the response was in flight. That does
+        // NOT mean it never reached Postgres: the statement can commit
+        // server-side even though the client never sees the
+        // acknowledgment. Ask the database what actually happened instead
+        // of assuming the throw means "rolled back."
+        const latest = await getJobById(deps.pool, jobId).catch(() => undefined);
+
+        if (latest?.status === "succeeded" && latest.result_attempt_token === runningToken) {
+          // It committed; only the acknowledgment was lost. This attempt
+          // is confirmed to have won -- proceed exactly as a normal
+          // success below, just with a note that the write's own response
+          // never arrived.
+          deps.logger.warn({ jobId, attempt: attemptNumber, err: commitErr }, "success update's acknowledgment was lost, but Postgres confirms this attempt's write committed");
+          succeededRow = latest;
+        } else if (latest && (latest.status === "succeeded" || latest.status === "failed")) {
+          // A different attempt is CONFIRMED to already own this job's
+          // outcome -- ours definitively did not land. Safe to discard:
+          // nothing will ever point at this directory.
+          await discardAttemptResult(deps.storagePaths, jobId, runningToken);
+          await recordAttemptEnd(deps.pool, attemptRowId, "succeeded", null).catch((err) =>
+            deps.logger.warn({ jobId, attempt: attemptNumber, err }, "recording this attempt's own history failed after a confirmed ownership loss"),
+          );
+          deps.logger.warn({ jobId, attempt: attemptNumber, err: commitErr }, "success update failed and a different attempt already owns this job; discarding this attempt's files");
+          return latest.result;
+        } else {
+          // Genuinely can't tell whether the write landed -- the row is
+          // still non-terminal (or even the re-check itself failed). A
+          // false "leave an orphaned directory around" is only a disk-
+          // hygiene cost the retention sweep eventually cleans up; a false
+          // "delete the real published result" is data loss. Never guess
+          // toward deletion: leave this attempt's files exactly where they
+          // are and let BullMQ's normal retry bookkeeping take over -- if
+          // this attempt actually did win, the next redelivery's
+          // duplicate-delivery guard at the top of processJob will
+          // discover that from Postgres on its own, without ever touching
+          // this directory again.
+          const message = commitErr instanceof Error ? commitErr.message : String(commitErr);
+          await recordAttemptEnd(deps.pool, attemptRowId, "retrying", `success update outcome uncertain: ${message}`).catch((err) =>
+            deps.logger.warn({ jobId, attempt: attemptNumber, err }, "recording this attempt's own history failed after an uncertain success update"),
+          );
+          deps.logger.error({ jobId, attempt: attemptNumber, err: commitErr }, "success update failed with an uncertain outcome; preserving this attempt's files rather than guessing");
+          throw commitErr;
+        }
+      }
+      await deps.afterSuccessCommit?.();
+
+      if (!succeededRow) {
+        // Lost the fencing-token race with an ordinary (non-throwing) 0-row
+        // update: a newer attempt (our own replacement, spun up after
+        // BullMQ decided our lock had expired) already claimed 'running'
+        // again and will finalize the job itself. Don't overwrite whatever
+        // it eventually writes -- and clean up the thumbnails we
+        // generated, since nothing will ever point at this directory now.
+        await discardAttemptResult(deps.storagePaths, jobId, runningToken);
+        const latest = await getJobById(deps.pool, jobId);
+        await recordAttemptEnd(deps.pool, attemptRowId, "succeeded", null).catch((err) =>
+          deps.logger.warn({ jobId, attempt: attemptNumber, err }, "recording this attempt's own history failed after a lost ownership race"),
+        );
+        deps.logger.warn({ jobId, attempt: attemptNumber }, "completed work but lost attempt-ownership race; discarding this attempt's files and job-level result");
+        return latest?.result ?? result;
+      }
+
+      // ---- Phase 3: post-success bookkeeping --------------------------
+      // The job is CONFIRMED succeeded, with this attempt's files as the
+      // published result (nothing to move -- that directory simply *is*
+      // the result now, permanently, until retention purges the whole
+      // job). Everything left is best-effort: a failure recording history
+      // or metrics must never undo the success, trigger a retry of
+      // already-completed work, or delete the files that are now the
+      // job's actual, durable result.
+      try {
+        const durationMs = Date.now() - startedAt;
+        await recordAttemptEnd(deps.pool, attemptRowId, "succeeded", null);
+        metrics.recordCompleted();
+        metrics.recordProcessingMs(durationMs);
+        deps.logger.info({ jobId, attempt: attemptNumber, transition: "running -> succeeded", durationMs }, "job succeeded");
+      } catch (bookkeepingErr) {
+        deps.logger.warn(
+          { jobId, attempt: attemptNumber, err: bookkeepingErr },
+          "post-success bookkeeping (attempt history or metrics) failed; the job itself succeeded and its published files are unaffected",
+        );
+      }
+      return result;
     } finally {
       deps.onJobEnd?.(jobId);
     }
