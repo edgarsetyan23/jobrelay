@@ -23,4 +23,8 @@ describe("sanitizeFilenameForDisplay", () => {
   it("limits the display label to 120 characters", () => {
     expect(sanitizeFilenameForDisplay("a".repeat(121))).toBe("a".repeat(120));
   });
+
+  it("removes trailing spaces exposed by truncation", () => {
+    expect(sanitizeFilenameForDisplay(`${"a".repeat(119)} b.jpg`)).toBe("a".repeat(119));
+  });
 });
