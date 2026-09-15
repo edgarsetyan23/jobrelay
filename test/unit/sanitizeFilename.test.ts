@@ -9,14 +9,14 @@ describe("sanitizeFilenameForDisplay", () => {
     },
   );
 
-  it.each(["/uploads/my photo-1.jpg", "C:\\uploads\\my photo-1.jpg"])(
+  it.each(["/uploads/my photo-1.jpg", "C:\\uploads\\my photo-1.jpg", "C:\\uploads/nested\\my photo-1.jpg"])(
     "preserves ordinary spaces and punctuation in the basename of %s",
     (filename) => {
       expect(sanitizeFilenameForDisplay(filename)).toBe("my photo-1.jpg");
     },
   );
 
-  it.each([undefined, "", "\n\t", "<>?!"])("uses a fallback for %j", (filename) => {
+  it.each([undefined, "", "\n\t", "<>?!", "/uploads/", "C:\\uploads\\"])("uses a fallback for %j", (filename) => {
     expect(sanitizeFilenameForDisplay(filename)).toBe("upload");
   });
 
