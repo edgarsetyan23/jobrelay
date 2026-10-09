@@ -128,7 +128,7 @@ somewhere else; see `test/integration/setup.ts`.
 ## Test results
 
 ```
-npm run test:unit        -> 13 passed  (2 files)
+npm run test:unit        -> 31 passed  (3 files)
 npm run test:integration -> 29 passed  (11 files, real Postgres + Redis;
                                          one test spawns and kills a real
                                          OS worker process)
