@@ -94,8 +94,7 @@ export interface GenerateThumbnailsResult {
 export async function generateThumbnails(sourcePath: string, outputPathFor: (label: string) => string, limits: ImageLimits): Promise<GenerateThumbnailsResult> {
   const buffer = await readFile(sourcePath);
   // The one and only place image format/dimensions are authoritatively
-  // validated, against the actual bytes on disk -- mirrors the original CSV
-  // job's "the worker validates the data" design. A bad file throws
+  // validated, against the actual bytes on disk. A bad file throws
   // ValidationError here and never gets this far again (see processor.ts).
   const metadata = await validateImageBuffer(buffer, limits);
 

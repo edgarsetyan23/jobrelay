@@ -32,7 +32,7 @@ npm run dev:api
 Then open **http://localhost:3000**. Click "Try a sample" and "Submit
 ticket", or scroll to the Demonstration panel and click "Stop this worker".
 
-See [5-minute demo script](docs/STUDY_GUIDE.md#five-minute-demo-script) for a
+See the [demo walkthrough](docs/DEMO.md) for a
 guided walkthrough.
 
 ## What it does
@@ -125,7 +125,7 @@ the dispatch board you're looking at in the browser. Override with
 `TEST_DATABASE_URL`/`TEST_REDIS_URL` if you need the suite to point
 somewhere else; see `test/integration/setup.ts`.
 
-## Test results (this session)
+## Test results
 
 ```
 npm run test:unit        -> 13 passed  (2 files)
@@ -142,7 +142,7 @@ measured throughput.
 
 `npm run bench` submits real HTTP requests through a real API + worker at
 several `WORKER_CONCURRENCY` settings and reports accept rate, completed
-jobs/sec, queue wait, and processing latency. Results from this session (8-core
+jobs/sec, queue wait, and processing latency. Results from one run (8-core
 desktop, local Postgres/Redis, 40 jobs/run, ~5.9KB synthetic JPEG) are in
 [bench/RESULTS.md](bench/RESULTS.md) -- summary:
 
@@ -180,19 +180,16 @@ are documented there.
   SIGTERM distinction), so the demo's "Stop this worker" and a graceful
   `Ctrl+C` behave differently mainly in whether the worker's own shutdown
   code gets to run at all.
-- **CSV-style narrow parsing choices carried over conceptually to images**:
-  only JPEG/PNG/WebP are accepted, and only three fixed thumbnail sizes are
-  produced -- deliberately narrow scope, not a general image pipeline.
+- **Narrow input scope**: only JPEG/PNG/WebP are accepted, and only three
+  fixed thumbnail sizes are produced. It's not a general image pipeline.
 - The real-child-process test in `test/integration/demoPanel.test.ts` is
-  slower and marginally more environment-sensitive than the rest of the
-  suite (it boots an actual Node process). It passed repeatedly in this
-  session; flag it first if the integration suite is ever flaky.
+  slower and more environment-sensitive than the rest of the suite (it boots
+  an actual Node process). If the integration suite is ever flaky, look
+  here first.
 - `test/integration/redisOutage.test.ts` stops and restarts the actual
-  Redis Docker container mid-test; it has been observed to time out once
-  when run as part of the full suite back-to-back with everything else
-  (passed cleanly alone, and on every other run) -- most likely Docker
-  container-restart timing under load rather than an application bug. If
-  it ever fails, re-run it in isolation before assuming a regression.
+  Redis Docker container mid-test. It timed out once during a full-suite run
+  and passed when run alone, so my guess is Docker restart timing. If it
+  fails, re-run it by itself before assuming a regression.
 
 ## Security
 
@@ -220,6 +217,5 @@ This is a local, single-tenant demonstration:
   why the outbox, multi-tenant, comparison with a Postgres-only queue).
 - [docs/FAILURE_SCENARIOS.md](docs/FAILURE_SCENARIOS.md) -- every recovery
   case, how it's implemented, and which test proves it.
-- [docs/STUDY_GUIDE.md](docs/STUDY_GUIDE.md) -- file-reading order, key
-  functions explained, interview questions, exercises, and the 5-minute demo
-  script.
+- [docs/DEMO.md](docs/DEMO.md) -- a five-minute walkthrough of the UI and
+  demo panel.

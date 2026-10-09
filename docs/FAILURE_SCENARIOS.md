@@ -212,8 +212,8 @@ covers the process disappearing outright; `postSuccessFailureIsolation.test.ts`
 covers the narrower but easier-to-actually-hit case where the *process*
 keeps running fine but one specific database write fails. `processJob`'s
 success path is split into three phases specifically so these two tests
-have something real to hold it to (see the "Three phases" writeup in
-`docs/STUDY_GUIDE.md`'s `makeProcessor` section for the full breakdown):
+have something real to hold it to (see the Phase 1/2/3 comments in
+`src/worker/processor.ts` for the full breakdown):
 
 - **History-write failure after success**: a real Postgres trigger (created
   and dropped by the test itself, not a mock) blocks every UPDATE to
