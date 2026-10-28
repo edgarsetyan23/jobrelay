@@ -7,6 +7,6 @@
 export function sanitizeFilenameForDisplay(rawName: string | undefined): string {
   if (!rawName) return "upload";
   const base = rawName.slice(Math.max(rawName.lastIndexOf("/"), rawName.lastIndexOf("\\")) + 1);
-  const cleaned = base.replace(/[^\w.\- ]/g, "").trim();
+  const cleaned = base.replace(/[^\p{L}\p{M}\p{N}_.\- ]/gu, "").trim();
   return (cleaned || "upload").slice(0, 120).trimEnd();
 }

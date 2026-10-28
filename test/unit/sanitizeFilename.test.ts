@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import { sanitizeFilenameForDisplay } from "../../src/util/sanitizeFilename.js";
 
 describe("sanitizeFilenameForDisplay", () => {
+  it.each(["caf\u00e9.jpg", "cafe\u0301.jpg", "\u6771\u4eac.png"])("preserves Unicode filename %s", (filename) => {
+    expect(sanitizeFilenameForDisplay(filename)).toBe(filename);
+  });
+
   it.each(["\n", "\r", "\t", "\v", "\f", "\u2028", "\u2029"])(
     "removes control and line-breaking whitespace %j",
     (whitespace) => {
