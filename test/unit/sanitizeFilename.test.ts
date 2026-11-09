@@ -16,8 +16,12 @@ describe("sanitizeFilenameForDisplay", () => {
     },
   );
 
-  it.each([undefined, "", "\n\t", "<>?!", "/uploads/", "C:\\uploads\\"])("uses a fallback for %j", (filename) => {
+  it.each([undefined, "", "   ", "\n\t", "<>?!", "/uploads/", "C:\\uploads\\"])("uses a fallback for %j", (filename) => {
     expect(sanitizeFilenameForDisplay(filename)).toBe("upload");
+  });
+
+  it("trims spaces around the display label", () => {
+    expect(sanitizeFilenameForDisplay("  photo.jpg  ")).toBe("photo.jpg");
   });
 
   it("limits the display label to 120 characters", () => {
