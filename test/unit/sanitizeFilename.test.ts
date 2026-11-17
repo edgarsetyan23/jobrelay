@@ -20,6 +20,10 @@ describe("sanitizeFilenameForDisplay", () => {
     expect(sanitizeFilenameForDisplay(filename)).toBe("upload");
   });
 
+  it("removes the drive prefix from a drive-relative Windows filename", () => {
+    expect(sanitizeFilenameForDisplay("C:my photo.jpg")).toBe("my photo.jpg");
+  });
+
   it("limits the display label to 120 characters", () => {
     expect(sanitizeFilenameForDisplay("a".repeat(121))).toBe("a".repeat(120));
   });
