@@ -24,6 +24,17 @@ describe("sanitizeFilenameForDisplay", () => {
     expect(sanitizeFilenameForDisplay("a".repeat(121))).toBe("a".repeat(120));
   });
 
+  it.each([".", "/uploads/..", "C:\\uploads\\.<>", `..${" ".repeat(118)}file`])(
+    "uses a fallback when the display label for %j is a directory marker",
+    (filename) => {
+      expect(sanitizeFilenameForDisplay(filename)).toBe("upload");
+    },
+  );
+
+  it("preserves a leading dot in a filename", () => {
+    expect(sanitizeFilenameForDisplay("/uploads/.photo.jpg")).toBe(".photo.jpg");
+  });
+
   it("removes trailing spaces exposed by truncation", () => {
     expect(sanitizeFilenameForDisplay(`${"a".repeat(119)} b.jpg`)).toBe("a".repeat(119));
   });
