@@ -9,7 +9,12 @@ describe("sanitizeFilenameForDisplay", () => {
     },
   );
 
-  it.each(["/uploads/my photo-1.jpg", "C:\\uploads\\my photo-1.jpg", "C:\\uploads/nested\\my photo-1.jpg"])(
+  it.each([
+    "/uploads/my photo-1.jpg",
+    "C:\\uploads\\my photo-1.jpg",
+    "C:\\uploads/nested\\my photo-1.jpg",
+    "c:my photo-1.jpg",
+  ])(
     "preserves ordinary spaces and punctuation in the basename of %s",
     (filename) => {
       expect(sanitizeFilenameForDisplay(filename)).toBe("my photo-1.jpg");
