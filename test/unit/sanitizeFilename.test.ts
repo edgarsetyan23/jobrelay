@@ -24,6 +24,10 @@ describe("sanitizeFilenameForDisplay", () => {
     expect(sanitizeFilenameForDisplay("a".repeat(121))).toBe("a".repeat(120));
   });
 
+  it.each([".", "..", "/uploads/.", "C:\\uploads\\.."])("uses a fallback for the directory marker %j", (filename) => {
+    expect(sanitizeFilenameForDisplay(filename)).toBe("upload");
+  });
+
   it("removes trailing spaces exposed by truncation", () => {
     expect(sanitizeFilenameForDisplay(`${"a".repeat(119)} b.jpg`)).toBe("a".repeat(119));
   });
