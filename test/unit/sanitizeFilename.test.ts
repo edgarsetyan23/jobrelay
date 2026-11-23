@@ -16,7 +16,7 @@ describe("sanitizeFilenameForDisplay", () => {
     },
   );
 
-  it.each([undefined, "", "\n\t", "<>?!", "/uploads/", "C:\\uploads\\"])("uses a fallback for %j", (filename) => {
+  it.each([undefined, "", "   ", "\n\t", "<>?!", "/uploads/", "C:\\uploads\\"])("uses a fallback for %j", (filename) => {
     expect(sanitizeFilenameForDisplay(filename)).toBe("upload");
   });
 
