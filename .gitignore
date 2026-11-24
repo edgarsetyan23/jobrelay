@@ -4,3 +4,6 @@ dist/
 *.log
 coverage/
 data/
+
+# Claude Code personal overrides
+.claude/settings.local.json
