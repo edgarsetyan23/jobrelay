@@ -17,9 +17,12 @@
     "cli:status": "tsx src/cli/status.ts",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration --no-file-parallelism",
+    "test:hunt": "vitest run --config vitest.hunt.config.ts",
     "test": "npm run test:unit && npm run test:integration",
     "bench": "tsx bench/benchmark.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:hooks": "node --test .claude/hooks/hooks.test.mjs",
+    "check:docs": "node scripts/check-failure-docs.mjs"
   },
   "dependencies": {
     "bullmq": "^6.3.4",

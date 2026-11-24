@@ -110,4 +110,6 @@ Extend `test/integration/demoPanel.test.ts` with the HTTP-level version.
 
 ## Before you finish
 
-Ask the `reliability-reviewer` subagent to review the diff.
+Ask the `reliability-reviewer` subagent to review the diff. If it reports a
+PLAUSIBLE finding, have the `failure-hunter` subagent try to prove it with a
+real test.

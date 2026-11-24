@@ -82,10 +82,24 @@ before calling something a regression.
 
 ## Claude Code setup in this repo
 
-- Hook (`.claude/settings.json` → `.claude/hooks/check-after-edit.mjs`):
-  after any edit to a `.ts` file it runs typecheck + unit tests and feeds
-  failures back.
-- Skills: `/add-fault-scenario`, `/add-migration`.
-- Subagent: `reliability-reviewer` — reviews a diff against the invariants
-  above. Ask for it before committing anything under `src/worker`,
-  `src/db`, `src/outbox`, or `src/queue`.
+Hooks (`.claude/settings.json`, scripts in `.claude/hooks/`, tested by
+`npm run test:hooks`):
+
+| Event | Hook | What it does |
+|---|---|---|
+| SessionStart | `session-context.mjs` | Reports branch, uncommitted files, and whether Postgres/Redis are up, so you know if integration tests can run. |
+| PreToolUse | `guard-edits.mjs` | Blocks edits to committed migrations, to `.env`, and any edit containing a credential. |
+| PostToolUse | `check-after-edit.mjs` | After a `.ts` edit: typecheck + unit tests; failures come back to you. |
+| Stop | `stop-gate.mjs` | Blocks finishing if `docs/FAILURE_SCENARIOS.md` and the test files disagree, and once per change set to critical code until `reliability-reviewer` has been run. |
+
+Skills: `/add-fault-scenario`, `/add-migration`.
+
+Subagents:
+- `reliability-reviewer`: read-only. Finds candidate bugs, then tries to
+  disprove each one (concrete interleaving, re-reading the guard, running
+  the matching integration tests when Docker is up) and reports only what
+  survives, labeled CONFIRMED or PLAUSIBLE.
+- `failure-hunter`: writes adversarial integration tests into
+  `test/integration/hunt/` (gitignored, run with `npm run test:hunt`),
+  runs them against real Postgres + Redis, and reports which guarantees
+  held. Use it to prove or rule out a PLAUSIBLE review finding.
