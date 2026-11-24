@@ -5,8 +5,8 @@
  * the server-generated job id instead).
  */
 export function sanitizeFilenameForDisplay(rawName: string | undefined): string {
-  if (!rawName) return "upload";
-  const base = rawName.slice(Math.max(rawName.lastIndexOf("/"), rawName.lastIndexOf("\\")) + 1);
+  const filename = rawName ?? "";
+  const base = filename.slice(Math.max(filename.lastIndexOf("/"), filename.lastIndexOf("\\")) + 1);
   const cleaned = base.replace(/[^\w.\- ]/g, "").trim();
   return (cleaned || "upload").slice(0, 120).trimEnd();
 }
