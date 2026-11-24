@@ -4,8 +4,12 @@
     "allow": [
       "Bash(npm run typecheck)",
       "Bash(npm run test:unit)",
+      "Bash(npm run test:hooks)",
+      "Bash(npm run check:docs)",
       "Bash(npm run test:integration*)",
+      "Bash(npm run test:hunt*)",
       "Bash(npx vitest run *)",
+      "Bash(docker ps*)",
       "Bash(git diff*)",
       "Bash(git status*)",
       "Bash(git log*)"
@@ -15,15 +19,33 @@
     ]
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/session-context.mjs\"", "timeout": 20 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-edits.mjs\"", "timeout": 15 }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
-          {
-            "type": "command",
-            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/check-after-edit.mjs\"",
-            "timeout": 120
-          }
+          { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/check-after-edit.mjs\"", "timeout": 120 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop-gate.mjs\"", "timeout": 30 }
         ]
       }
     ]

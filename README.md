@@ -222,16 +222,19 @@ This is a local, single-tenant demonstration:
 
 ## Working on this repo with Claude Code
 
-The repo includes a shared Claude Code setup in `.claude/` and `CLAUDE.md`,
-configured the way I'd set it up for a team: the rules live in the repo,
-not in one person's prompts.
+The repo includes a shared Claude Code setup in `.claude/` and `CLAUDE.md`. The design goal is that the reliability rules from `docs/` are *enforced* on AI-assisted changes, not just described: anything that must always happen is a hook (Claude Code runs it, so it can't be skipped), and anything that needs judgment is a skill or a subagent.
 
-| Piece | File | Why |
+| Piece | File | What it does and why |
 |---|---|---|
-| Project instructions | `CLAUDE.md` | The architecture on one screen, plus the six invariants the reliability guarantees depend on (fencing token on every finalize, outbox written in the same transaction, attempt-isolated files, and the rest). A new contributor, human or agent, gets the "don't break these" list before touching the worker. |
-| Skill: `/add-fault-scenario` | `.claude/skills/add-fault-scenario/` | Adding a failure scenario has a fixed shape here: a trigger that can be repeated exactly (an existing fault mode, a gate on a processor seam, a Postgres trigger, or a real `docker stop`), an integration test against real Postgres and Redis, and a row in `docs/FAILURE_SCENARIOS.md`. The skill writes that procedure down, including the rule that faults only fire for `is_demo` jobs. |
-| Skill: `/add-migration` | `.claude/skills/add-migration/` | Migrations are forward-only numbered SQL files. The common mistake is writing a new column in a separate follow-up UPDATE when it should go in the same guarded UPDATE as the state transition. The skill covers both. |
-| Hook: check after edit | `.claude/settings.json`, `.claude/hooks/check-after-edit.mjs` | After every edit to a `.ts` file, runs `typecheck` + `test:unit` (about 2s total). Failures go back to Claude with exit code 2, so it fixes a break right away instead of piling more edits on top. Integration tests are left out because they need Docker and take much longer. CI still runs the unit tests on every push. |
-| Subagent: `reliability-reviewer` | `.claude/agents/reliability-reviewer.md` | A read-only reviewer that checks a diff against those invariants in priority order and reports each finding with a concrete failure sequence. It runs in its own context, so the review doesn't inherit the author's assumptions. |
+| Project instructions | `CLAUDE.md` | The architecture on one screen and the six invariants the crash-recovery guarantees depend on. |
+| **SessionStart hook** | `.claude/hooks/session-context.mjs` | Tells Claude whether Postgres and Redis are up, so it either runs the integration tests or says plainly that it didn't. |
+| **PreToolUse guard** | `.claude/hooks/guard-edits.mjs` | Blocks edits to committed migrations (`migrate.ts` never re-runs a recorded filename, so the edit would silently never reach existing databases), edits to `.env`, and any edit containing a credential. |
+| **PostToolUse check** | `.claude/hooks/check-after-edit.mjs` | Runs typecheck + unit tests (about 2s) after every `.ts` edit and sends failures back to Claude. |
+| **Stop gate** | `.claude/hooks/stop-gate.mjs` | Before Claude finishes: fails if `docs/FAILURE_SCENARIOS.md` cites a test that doesn't exist or misses one that does, and requires a `reliability-reviewer` pass once per change set to the worker, database, outbox, queue, or fault code. |
+| Skills | `/add-fault-scenario`, `/add-migration` | Step-by-step procedures for the two most common risky changes. |
+| **Subagent: `reliability-reviewer`** | `.claude/agents/reliability-reviewer.md` | Read-only reviewer with a two-pass process: find candidates, then try to disprove each one by writing out the exact interleaving and checking for the guard that prevents it. Only surviving findings are reported, labeled CONFIRMED or PLAUSIBLE, with a merge verdict. |
+| **Subagent: `failure-hunter`** | `.claude/agents/failure-hunter.md` | Writes adversarial integration tests (crash at each await, stale attempts finishing late, concurrent duplicate delivery) against real Postgres and Redis, runs them, and reports which guarantees held. It can only write into a gitignored scratch folder. |
+
+The hooks are tested code: `npm run test:hooks` runs 13 tests that feed each hook a real event, using throwaway git repos for the Stop gate. CI runs them along with `npm run check:docs` on every push.
 
 Personal overrides go in `.claude/settings.local.json`, which is gitignored.
