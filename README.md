@@ -219,3 +219,19 @@ This is a local, single-tenant demonstration:
   case, how it's implemented, and which test proves it.
 - [docs/DEMO.md](docs/DEMO.md) -- a five-minute walkthrough of the UI and
   demo panel.
+
+## Working on this repo with Claude Code
+
+The repo includes a shared Claude Code setup in `.claude/` and `CLAUDE.md`,
+configured the way I'd set it up for a team: the rules live in the repo,
+not in one person's prompts.
+
+| Piece | File | Why |
+|---|---|---|
+| Project instructions | `CLAUDE.md` | The architecture on one screen, plus the six invariants the reliability guarantees depend on (fencing token on every finalize, outbox written in the same transaction, attempt-isolated files, and the rest). A new contributor, human or agent, gets the "don't break these" list before touching the worker. |
+| Skill: `/add-fault-scenario` | `.claude/skills/add-fault-scenario/` | Adding a failure scenario has a fixed shape here: a trigger that can be repeated exactly (an existing fault mode, a gate on a processor seam, a Postgres trigger, or a real `docker stop`), an integration test against real Postgres and Redis, and a row in `docs/FAILURE_SCENARIOS.md`. The skill writes that procedure down, including the rule that faults only fire for `is_demo` jobs. |
+| Skill: `/add-migration` | `.claude/skills/add-migration/` | Migrations are forward-only numbered SQL files. The common mistake is writing a new column in a separate follow-up UPDATE when it should go in the same guarded UPDATE as the state transition. The skill covers both. |
+| Hook: check after edit | `.claude/settings.json`, `.claude/hooks/check-after-edit.mjs` | After every edit to a `.ts` file, runs `typecheck` + `test:unit` (about 2s total). Failures go back to Claude with exit code 2, so it fixes a break right away instead of piling more edits on top. Integration tests are left out because they need Docker and take much longer. CI still runs the unit tests on every push. |
+| Subagent: `reliability-reviewer` | `.claude/agents/reliability-reviewer.md` | A read-only reviewer that checks a diff against those invariants in priority order and reports each finding with a concrete failure sequence. It runs in its own context, so the review doesn't inherit the author's assumptions. |
+
+Personal overrides go in `.claude/settings.local.json`, which is gitignored.
