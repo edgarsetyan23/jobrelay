@@ -20,6 +20,10 @@ describe("sanitizeFilenameForDisplay", () => {
     expect(sanitizeFilenameForDisplay(filename)).toBe("upload");
   });
 
+  it.each([".", "..", "/uploads/.", "C:\\uploads\\.."])("uses a fallback for directory marker %j", (filename) => {
+    expect(sanitizeFilenameForDisplay(filename)).toBe("upload");
+  });
+
   it("limits the display label to 120 characters", () => {
     expect(sanitizeFilenameForDisplay("a".repeat(121))).toBe("a".repeat(120));
   });
