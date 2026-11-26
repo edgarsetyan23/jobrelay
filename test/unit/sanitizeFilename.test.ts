@@ -24,6 +24,19 @@ describe("sanitizeFilenameForDisplay", () => {
     expect(sanitizeFilenameForDisplay("a".repeat(121))).toBe("a".repeat(120));
   });
 
+  it.each(["caf\u00e9.jpg", "cafe\u0301.jpg", "\u5199\u771f.jpg"])(
+    "preserves Unicode letters and accents in %s",
+    (filename) => {
+      expect(sanitizeFilenameForDisplay(filename)).toBe(filename);
+    },
+  );
+
+  it("avoids splitting a supplementary Unicode letter at the length limit", () => {
+    const letter = "\u{10400}";
+    expect(sanitizeFilenameForDisplay(`${"a".repeat(118)}${letter}.jpg`)).toBe(`${"a".repeat(118)}${letter}`);
+    expect(sanitizeFilenameForDisplay(`${"a".repeat(119)}${letter}.jpg`)).toBe("a".repeat(119));
+  });
+
   it("removes trailing spaces exposed by truncation", () => {
     expect(sanitizeFilenameForDisplay(`${"a".repeat(119)} b.jpg`)).toBe("a".repeat(119));
   });
